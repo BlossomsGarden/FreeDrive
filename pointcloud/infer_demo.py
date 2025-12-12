@@ -20,13 +20,10 @@ from depth_anything_3.api import DepthAnything3
 from align_depth_with_lidar import process, ID_TO_CAMERA_NAME
 from depth_anything_3.utils.export import export
 
-
 # ------------------------------
 # Basic configuration
 # ------------------------------
-# Update these paths to match your processed Waymo export
-# data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
-data_root = "input003"
+data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
 num_frames = 40
 # cam_ids = [3, 1, 0, 2, 4]  # 0, 1, 2, 3, 4 for FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
 cam_ids = [0, 1, 2]
@@ -35,9 +32,7 @@ cam_ids = [0, 1, 2]
 use_known_poses = True  # Set to False for pose-free estimation
 
 
-def load_intrinsics(
-    intrinsics_dir: str, cam_ids, orig_size: Tuple[int, int], target_size: Tuple[int, int]
-):
+def load_intrinsics(intrinsics_dir: str, cam_ids, orig_size: Tuple[int, int], target_size: Tuple[int, int]):
     """Load K matrices (3x3) from Waymo intrinsics txt files and scale to target size.
 
     Files store [fx, fy, cx, cy, k1, k2, p1, p2, k3]; distortion terms are
@@ -224,8 +219,10 @@ if __name__ == "__main__":
     # process_res=1008 表示最长边缩放到 1008
     # lidar_target_resolution=(1008, 672) 表示 (H, W) = (height, width)
     # 这样在 lidar alignment 时会将所有数据（深度图、置信度图、lidar投影点）统一缩放到 672x1008
-    process_resolution = 756
-    lidar_target_resolution = (504, 756)  # (H, W) format for 336x504
+    process_resolution = 504
+    lidar_target_resolution = (336, 504)  # (H, W) format for 336x504
+    # process_resolution = 756
+    # lidar_target_resolution = (504, 756)  # (H, W) format for 504x756
     # process_resolution = 1008
     # lidar_target_resolution = (672, 1008)  # (H, W) format for 672x1008
     
@@ -437,7 +434,7 @@ if __name__ == "__main__":
         npz_output_dir = output_base_dir / "aligned_depths_npz"
         npz_output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save per-camera npz files (same format as custom_data_to_glb.py expects)
+        # Save per-camera npz files
         for cam_id in cam_ids:
             npz_path = npz_output_dir / f"{cam_id}_depths.npz"
             np.savez_compressed(str(npz_path), depths=aligned_per_cam[cam_id].astype(np.float32))
@@ -532,47 +529,66 @@ if __name__ == "__main__":
 
 
     # ------------------------------------------------------------------------------------------------
-    # Export to GLB using custom_data_to_glb logic
+    # Export to GLB/NPZ
     # ------------------------------------------------------------------------------------------------
+    # Export format configuration: "glb", "npz", or "glb-npz" (both)
+    export_formats = "glb-npz"  # Change to "glb" or "npz" to export only one format
+    formats_list = export_formats.split("-") if "-" in export_formats else [export_formats]
+    
     print("\n" + "="*60)
-    print("Exporting to GLB")
+    print(f"Exporting to: {formats_list}")
     print("="*60)
-    
-    # GLB export parameters
-    glb_output_dir = output_base_dir / "glb_output"
-    glb_output_dir.mkdir(parents=True, exist_ok=True)
-    
-    conf_thresh_percentile = 40.0
-    num_max_points = 2_000_000
-    show_cameras = True
-    prediction.is_metric = 1
     
     # Ensure we have confidence maps
     if prediction.conf is None:
         print("  Creating default confidence maps (all ones)...")
         prediction.conf = np.ones_like(prediction.depth, dtype=np.float32)
     
-    print(f"  Exporting GLB with {len(prediction.depth)} views...")
-    print(f"    - Depth shape: {prediction.depth.shape}")
-    print(f"    - Confidence shape: {prediction.conf.shape}")
-    print(f"    - Extrinsics shape: {np.asarray(prediction.extrinsics).shape}")
-    print(f"    - Intrinsics shape: {np.asarray(prediction.intrinsics).shape}")
-    print(f"    - Max points: {num_max_points}")
-    print(f"    - Confidence threshold percentile: {conf_thresh_percentile}")
+    print(f"  Exporting with {len(prediction.depth)} views...")
     
-    # Export to GLB
-    export(
-        prediction,
-        export_format="glb",
-        export_dir=str(glb_output_dir),
-        glb={
-            "num_max_points": num_max_points,
-            "conf_thresh_percentile": conf_thresh_percentile,
-            "show_cameras": show_cameras,
-        },
-    )
+    # Note: GLB saves to {export_dir}/scene.glb
+    #       NPZ saves to {export_dir}/exports/npz/results.npz
+    # Since paths differ, we handle each format separately
     
-    print(f"\n✓ GLB exported to: {glb_output_dir / 'scene.glb'}")
+    export_dir = output_base_dir / "output"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    # Export each format
+    for fmt in formats_list:
+        if fmt == "glb":
+            # GLB export parameters (only used if exporting GLB)
+            conf_thresh_percentile = 30.0
+            num_max_points = 2_000_000
+            show_cameras = True
+            prediction.is_metric = 1
+            glb_kwargs = {
+                "num_max_points": num_max_points,
+                "conf_thresh_percentile": conf_thresh_percentile,
+                "show_cameras": show_cameras,
+            } 
+    
+            export(
+                prediction,
+                export_format="glb",
+                export_dir=str(export_dir),
+                glb=glb_kwargs,
+            )
+            
+        elif fmt == "npz":
+            if prediction.processed_images is None:
+                assert False, f"  Warning: prediction.processed_images is None, cannot export NPZ format."
+                
+            export(
+                prediction,
+                export_format="npz",
+                export_dir=str(export_dir),
+            )
+            
+        else:
+            raise ValueError(f"Unsupported export format: {fmt}")
+    
+    # Print summary
+    print(f"\n✓ Export completed!")
     print("="*60)
 
 

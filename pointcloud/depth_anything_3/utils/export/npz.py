@@ -24,7 +24,7 @@ def export_to_npz(
     prediction: Prediction,
     export_dir: str,
 ):
-    output_file = os.path.join(export_dir, "exports", "npz", "results.npz")
+    output_file = os.path.join(export_dir, "results.npz")
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # Use prediction.processed_images, which is already processed image data

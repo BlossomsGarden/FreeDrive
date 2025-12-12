@@ -49,6 +49,7 @@ CUDA_VISIBLE_DEVICES=3 python infer_demo.py
 - [x] DA3 inference with provided camera
 - [x] WOD tfrecord to images/cam extrinsics scripts
 - [ ] Reload scene from *.npz, get dense point cloud seq, unseen patch seq with given camera
+- [ ] Support SIDE_LEFT/SIDE_RIGHT
 - [ ] Test VideoPainter
 - [ ] FID/NTA IoU
 - [ ] Add Image Branch and fine-tune
