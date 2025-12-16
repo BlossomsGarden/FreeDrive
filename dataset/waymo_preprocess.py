@@ -798,6 +798,6 @@ if __name__ == "__main__":
     processor = WaymoProcessor(
         load_dir="/data/wlh/FreeDrive/data/waymo/raw",
         save_dir="/data/wlh/FreeDrive/data/waymo/processed",
-        num_frames=40,
+        num_frames=49,
     )
     processor.convert()

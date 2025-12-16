@@ -24,7 +24,7 @@ from depth_anything_3.utils.export import export
 # Basic configuration
 # ------------------------------
 data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
-num_frames = 40
+num_frames = 49
 # cam_ids = [3, 1, 0, 2, 4]  # 0, 1, 2, 3, 4 for FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
 cam_ids = [0, 1, 2]
 

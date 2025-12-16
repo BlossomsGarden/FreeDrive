@@ -1,0 +1,37 @@
+conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia
+
+pip install transformers==4.42.2  accelerate>=0.34.2
+
+pip install deepspeed==0.18.3
+
+pip install pytorchvideo==0.1.5
+
+pip uninstall opencv-python
+
+pip install opencv-python==4.10.0.84   numpy==1.26.0
+
+pip install pillow==9.5.0   imageio>=2.35.1  imageio-ffmpeg==0.5.1  ffmpeg-python
+
+pip install   moviepy>=1.0.3   decord==0.6.0  kornia==0.7.3  scikit-image
+
+# git+https://github.com/openai/CLIP.git
+cd CLIP-main
+pip install -e .
+
+pip install openai>=1.45.0   bitsandbytes  sentencepiece>=0.2.0
+
+pip install numpy==1.26.0   scipy   einops  rotary_embedding_torch  pytorch_lightning easydict  pandas  matplotlib   gradio==3.40.0   wandb  nvitop   omegaconf==2.3.0   beartype==0.18.5   fsspec==2024.5.0   safetensors==0.4.3   huggingface_hub==0.25.0   av==13.1.0  gdown
+
+pip uninstall torch torchvision
+
+conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.4 -c pytorch -c nvidia
+
+pip install xformers==0.0.27.post2
+
+pip install peft==0.10.0
+
+cd ./diffusers
+pip install -e .
+
+conda install -c conda-forge ffmpeg -y
+
