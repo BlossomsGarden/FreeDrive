@@ -25,6 +25,15 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+
+# Try to import torch_npu for NPU 910B support
+try:
+    import torch_npu
+    HAS_NPU = True
+    print("✓ torch_npu imported successfully - using NPU 910B device")
+except ImportError:
+    HAS_NPU = False
+    print("✓ torch_npu not available - using CUDA/CPU device")
 from huggingface_hub import PyTorchModelHubMixin
 from PIL import Image
 
@@ -118,7 +127,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             Dictionary containing model predictions
         """
         # Determine optimal autocast dtype
-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        autocast_dtype = torch.bfloat16
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                 return self.model(image, extrinsics, intrinsics, export_feat_layers, infer_gs)
@@ -359,14 +368,23 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
     ) -> dict[str, torch.Tensor]:
         """Run model forward pass."""
         device = imgs.device
-        need_sync = device.type == "cuda"
-        if need_sync:
-            torch.cuda.synchronize(device)
+        if HAS_NPU:
+            need_sync = device.type == "npu"
+            if need_sync:
+                torch.npu.synchronize(device)
+        else:
+            need_sync = device.type == "cuda"
+            if need_sync:
+                torch.cuda.synchronize(device)
         start_time = time.time()
         feat_layers = list(export_feat_layers) if export_feat_layers is not None else None
         output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs)
-        if need_sync:
-            torch.cuda.synchronize(device)
+        if HAS_NPU:
+            if need_sync:
+                torch.npu.synchronize(device)
+        else:
+            if need_sync:
+                torch.cuda.synchronize(device)
         end_time = time.time()
         logger.info(f"Model Forward Pass Done. Time: {end_time - start_time} seconds")
         return output

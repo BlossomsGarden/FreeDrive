@@ -25,6 +25,14 @@ from pathlib import Path
 from glob import glob
 from typing import Tuple, Optional
 from tqdm import tqdm
+# Try to import torch_npu for NPU 910B support
+try:
+    import torch_npu
+    HAS_NPU = True
+    print("✓ torch_npu imported successfully - using NPU 910B device")
+except ImportError:
+    HAS_NPU = False
+    print("✓ torch_npu not available - using CUDA/CPU device")
 
 
 def _as_homogeneous44(ext: np.ndarray) -> np.ndarray:
@@ -91,6 +99,70 @@ def depths_to_world_points_with_colors(
         Xw = (c2w @ Xc_h)[:3].T.astype(np.float32)  # (M,3)
 
         cols = images_u8[i].reshape(-1, 3)[vidx].astype(np.uint8)  # (M,3)
+
+        pts_all.append(Xw)
+        col_all.append(cols)
+
+    if len(pts_all) == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+
+    return np.concatenate(pts_all, 0), np.concatenate(col_all, 0)
+
+
+def depths_to_world_points_with_colors_single_frame(
+    depth_frame_list: list,
+    K_list: list,
+    ext_w2c_list: list,
+    images_u8_list: list,
+    conf_list: Optional[list] = None,
+    conf_thr: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert depth maps from a single frame (multiple cameras) to world coordinate points with colors.
+    
+    Args:
+        depth_frame_list: List of (H, W) depth maps for this frame (one per camera)
+        K_list: List of (3, 3) camera intrinsics (one per camera)
+        ext_w2c_list: List of (4, 4) or (3, 4) world-to-camera extrinsics (one per camera)
+        images_u8_list: List of (H, W, 3) RGB images (one per camera)
+        conf_list: Optional list of (H, W) confidence maps (one per camera)
+        conf_thr: Confidence threshold
+        
+    Returns:
+        points_world: (M, 3) world coordinate points
+        colors: (M, 3) RGB colors
+    """
+    if len(depth_frame_list) == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+    
+    H, W = depth_frame_list[0].shape
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    ones = np.ones_like(us)
+    pix = np.stack([us, vs, ones], axis=-1).reshape(-1, 3)  # (H*W,3)
+
+    pts_all, col_all = [], []
+
+    for i in range(len(depth_frame_list)):
+        d = depth_frame_list[i]  # (H,W)
+        valid = np.isfinite(d) & (d > 0)
+        if conf_list is not None and conf_list[i] is not None:
+            valid &= conf_list[i] >= conf_thr
+        if not np.any(valid):
+            continue
+
+        d_flat = d.reshape(-1)
+        vidx = np.flatnonzero(valid.reshape(-1))
+
+        K_inv = np.linalg.inv(K_list[i])  # (3,3)
+        ext_w2c_h = _as_homogeneous44(ext_w2c_list[i])  # (4,4)
+        c2w = np.linalg.inv(ext_w2c_h)  # (4,4) camera-to-world
+
+        rays = K_inv @ pix[vidx].T  # (3,M)
+        Xc = rays * d_flat[vidx][None, :]  # (3,M)
+        Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
+        Xw = (c2w @ Xc_h)[:3].T.astype(np.float32)  # (M,3)
+
+        cols = images_u8_list[i].reshape(-1, 3)[vidx].astype(np.uint8)  # (M,3)
 
         pts_all.append(Xw)
         col_all.append(cols)
@@ -261,6 +333,38 @@ def load_npz_pointcloud(npz_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return points_world, colors
 
 
+def load_npz_data(npz_path: str) -> dict:
+    """
+    Load raw data from npz file without converting to point cloud.
+    
+    Args:
+        npz_path: Path to npz file containing 'image', 'depth', 'extrinsics', 'intrinsics'
+        
+    Returns:
+        Dictionary containing:
+            - images: (N, H, W, 3) uint8 RGB images
+            - depths: (N, H, W) depth maps
+            - extrinsics: (N, 4, 4) or (N, 3, 4) world-to-camera extrinsics
+            - intrinsics: (N, 3, 3) camera intrinsics
+            - conf: Optional (N, H, W) confidence maps
+    """
+    data = np.load(npz_path)
+    
+    result = {
+        'images': data['image'],  # (N, H, W, 3) uint8
+        'depths': data['depth'],  # (N, H, W)
+        'extrinsics': data['extrinsics'],  # (N, 4, 4) or (N, 3, 4)
+        'intrinsics': data['intrinsics'],  # (N, 3, 3)
+    }
+    
+    if 'conf' in data:
+        result['conf'] = data['conf']
+    else:
+        result['conf'] = None
+    
+    return result
+
+
 def load_extrinsics_sequence(extrinsics_dir: str, cam_id: int, num_frames: Optional[int] = None) -> list:
     """
     Load camera extrinsics sequence from extrinsics folder.
@@ -368,9 +472,11 @@ def compute_world_to_camera_from_waymo(
         cam_to_ego: (4, 4) camera-to-ego transform (Waymo format)
         ego_to_world: (4, 4) ego-to-world transform (Waymo format)
         convert_coordinates: If True, convert from Waymo to CV coordinate system
-        camera_offset: Optional (3,) offset in world coordinates [x, y, z]
-                      In CV coordinates: x=right(+), y=down(+), z=forward(+)
-                      So: left=-x, right=+x, up=-y, down=+y, forward=+z, backward=-z
+        camera_offset: Optional (3,) offset in Waymo vehicle coordinates [x, y, z]
+                      In Waymo coordinates: x=forward(+), y=left(+), z=up(+)
+                      So: forward=+x, backward=-x, left=+y, right=-y, up=+z, down=-z
+                      This offset is applied directly to the extrinsic matrix translation part,
+                      similar to lidarproj_halfreso_multiframe.py implementation.
         
     Returns:
         world_to_camera: (4, 4) world-to-camera transform (CV format)
@@ -380,13 +486,28 @@ def compute_world_to_camera_from_waymo(
         world_to_camera = ego_to_camera @ world_to_ego
         world_to_camera = inv(cam_to_ego) @ inv(ego_to_world)
     """
+    # Apply camera offset BEFORE coordinate conversion, similar to lidarproj_halfreso_multiframe.py
+    # The offset is applied directly to the extrinsic matrix translation part in Waymo coordinates
+    cam_to_ego_modified = cam_to_ego.copy()
+    if camera_offset is not None:
+        camera_offset = np.array(camera_offset, dtype=np.float32)
+        if camera_offset.shape == (3,):
+            # Apply offset directly to extrinsic matrix translation part (Waymo format)
+            # In Waymo: x=forward, y=left, z=up
+            # extrinsic[3] (or [0,3]) = x translation (forward)
+            # extrinsic[7] (or [1,3]) = y translation (left)  
+            # extrinsic[11] (or [2,3]) = z translation (up)
+            cam_to_ego_modified[0, 3] += camera_offset[0]  # forward/backward
+            cam_to_ego_modified[1, 3] += camera_offset[1]  # left/right
+            cam_to_ego_modified[2, 3] += camera_offset[2]  # up/down
+    
     if convert_coordinates:
         # Convert to CV coordinate system
         waymo_to_cv = waymo_to_cv_coordinate_transform()
         cv_to_waymo = np.linalg.inv(waymo_to_cv)
         
-        # Convert camera->ego to CV coordinate system
-        cam_to_ego_cv = waymo_to_cv @ cam_to_ego @ cv_to_waymo
+        # Convert camera->ego to CV coordinate system (using modified cam_to_ego)
+        cam_to_ego_cv = waymo_to_cv @ cam_to_ego_modified @ cv_to_waymo
         
         # Convert ego->world to CV coordinate system
         ego_to_world_cv = waymo_to_cv @ ego_to_world @ cv_to_waymo
@@ -402,23 +523,8 @@ def compute_world_to_camera_from_waymo(
     else:
         # Assume inputs are already in CV coordinate system
         world_to_ego = np.linalg.inv(ego_to_world)
-        ego_to_camera = np.linalg.inv(cam_to_ego)
+        ego_to_camera = np.linalg.inv(cam_to_ego_modified)
         world_to_camera = ego_to_camera @ world_to_ego
-    
-    # Apply camera offset if specified
-    # Offset is in world coordinates, so we need to modify the camera position
-    # We do this by modifying the translation part of world_to_camera
-    if camera_offset is not None:
-        camera_offset = np.array(camera_offset, dtype=np.float32)
-        if camera_offset.shape == (3,):
-            # Convert world_to_camera to camera_to_world
-            camera_to_world = np.linalg.inv(world_to_camera)
-            
-            # Add offset to camera position (translation part)
-            camera_to_world[:3, 3] += camera_offset
-            
-            # Convert back to world_to_camera
-            world_to_camera = np.linalg.inv(camera_to_world)
     
     return world_to_camera
 
@@ -426,54 +532,61 @@ def compute_world_to_camera_from_waymo(
 def main():
     """
     Main function to render point cloud views.
+    Modified to process each frame separately: for each frame, build 3D point cloud
+    from that frame's depth maps (all cameras), then render using the specified camera.
     """
     # ============================================================================
     # Configuration - Modify these variables as needed
     # ============================================================================
-    npz_path = "./output/output/results.npz"  # Path to npz file containing point cloud
-    data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
+    npz_path = "./known_poses_output_5cam/output/results.npz"  # Path to npz file containing point cloud
+    if HAS_NPU:
+        data_root = "/home/ma-user/modelarts/user-job-dir/wlh/data/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
+    else:
+        data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
     cam_id = 0  # Camera ID to use for rendering (0=FRONT, 1=FRONT_LEFT, 2=FRONT_RIGHT, 3=SIDE_LEFT, 4=SIDE_RIGHT)
     output_dir = "rendered_views"  # Output directory for videos
-    image_size = [1920, 1280]  # Output image size [width, height]
+    orig_size = (1920, 1280)  # Waymo default
+    target_size = (1008, 672)
     fps = 10  # FPS for output videos
-    num_frames = None  # Number of frames to render (None = use all available)
+    num_frames = 49  # Number of frames to render (None = use all available)
     
-    # Camera offset in world coordinates (meters)
-    # In CV coordinate system: x=right(+), y=down(+), z=forward(+)
-    # Examples:
-    #   Left 1m:  [-1.0, 0.0, 0.0]
-    #   Right 1m: [ 1.0, 0.0, 0.0]
-    #   Up 1m:    [ 0.0, -1.0, 0.0]
-    #   Down 1m:  [ 0.0,  1.0, 0.0]
-    #   Forward 1m: [0.0, 0.0, 1.0]
-    #   Backward 1m: [0.0, 0.0, -1.0]
+    # Point cloud building mode:
+    #   True: Build point cloud per frame (each frame uses only cam_ids_in_npz cameras from that frame)
+    #   False: Accumulate all frames together (all frames from cam_ids_in_npz cameras accumulated)
+    use_single_frame_pointcloud = True  # Set to False to accumulate all frames from cam_ids_in_npz
+    
+    # Camera IDs used in the npz file (must match the order in da3_infer.py)
+    # This determines which cameras' depth maps are used to build the point cloud for each frame
+    # Only used when use_single_frame_pointcloud = True
+    cam_ids_in_npz = [0, 1, 2]  # Must match cam_ids in da3_infer.py
+    
+    # Camera offset in Waymo vehicle coordinates (meters)
+    # Applied directly to extrinsic matrix translation part, similar to lidarproj_halfreso_multiframe.py
+    # In Waymo coordinates: x=forward(+), y=left(+), z=up(+)
+    # Examples (in real-world scale, 1 meter = 1.0):
+    #   Forward 1m:  [ 1.0, 0.0, 0.0]
+    #   Backward 1m: [-1.0, 0.0, 0.0]
+    #   Left 1m:     [ 0.0, 1.0, 0.0]
+    #   Right 1m:    [ 0.0, -1.0, 0.0]
+    #   Up 1m:       [ 0.0, 0.0, 1.0]
+    #   Down 1m:     [ 0.0, 0.0, -1.0]
     # Set to None to disable offset
-    # camera_offset = None  # [x_offset, y_offset, z_offset] in meters, None means FRONT by default.
-    # camera_offset = [-5.0, 0.0, 0.0]  # Example: Forward 1? meter
-    camera_offset = [0.0, 0.0, 2.5]   # Example: Right by 1? meter
-    # camera_offset = [0.0, -5.0, 0.0]  # Example: Up by 1? meter
+    # camera_offset = None  # [x_offset, y_offset, z_offset] in meters (Waymo coordinates), None means no offset.
+    # camera_offset = [1.0, 0.0, 0.0]   # Example: Forward 1 meter
+    camera_offset = [0.0, -1.5, 0.0]  # Example: Right 2 meter
+    # camera_offset = [0.0, 0.0, 1.0]   # Example: Up 1 meter
     # ============================================================================
     
-    # Load point cloud
-    print("Loading point cloud from npz file...")
-    points_world, colors = load_npz_pointcloud(npz_path)
-    
-    if points_world.shape[0] == 0:
-        raise ValueError("No points found in point cloud!")
-    
-    # Load camera parameters
-    print("Loading camera parameters...")
+    # Load camera parameters for rendering
+    print("Loading camera parameters for rendering...")
     
     # Get intrinsics directory
     extrinsics_dir = os.path.join(data_root, "extrinsics")
     intrinsics_dir = os.path.join(data_root, "intrinsics")
     ego_pose_dir = os.path.join(data_root, "ego_pose")
     
-    # Determine original image size (you may need to adjust this)
-    orig_size = (1920, 1280)  # Waymo default
-    target_size = tuple(image_size)
     
-    K = load_intrinsics(intrinsics_dir, cam_id, orig_size, target_size)
+    K_render = load_intrinsics(intrinsics_dir, cam_id, orig_size, target_size)
     
     # Load ego poses
     if not os.path.exists(ego_pose_dir):
@@ -484,14 +597,139 @@ def main():
         key=lambda p: int(os.path.splitext(os.path.basename(p))[0])
     )
     
-    if num_frames is not None:
-        pose_files = pose_files[:num_frames]
+    # Load camera-to-ego extrinsic (constant) for rendering camera
+    cam_to_ego_render = np.loadtxt(os.path.join(extrinsics_dir, f"{cam_id}.txt")).reshape(4, 4)
     
-    num_frames = len(pose_files)
-    print(f"Found {num_frames} frames")
-    
-    # Load camera-to-ego extrinsic (constant)
-    cam_to_ego = np.loadtxt(os.path.join(extrinsics_dir, f"{cam_id}.txt")).reshape(4, 4)
+    # Choose point cloud building mode
+    if use_single_frame_pointcloud:
+        # Mode 1: Build point cloud per frame (only use cam_ids_in_npz for each frame)
+        print("="*60)
+        print("Mode: Single-frame point cloud (per-frame rendering)")
+        print("="*60)
+        
+        # Load npz data (without converting to point cloud yet)
+        print("Loading npz data...")
+        npz_data = load_npz_data(npz_path)
+        
+        images = npz_data['images']  # (N, H, W, 3) uint8
+        depths = npz_data['depths']  # (N, H, W)
+        extrinsics = npz_data['extrinsics']  # (N, 4, 4) or (N, 3, 4)
+        intrinsics = npz_data['intrinsics']  # (N, 3, 3)
+        conf = npz_data['conf']  # (N, H, W) or None
+        
+        num_total_views = depths.shape[0]
+        num_cams_in_npz = len(cam_ids_in_npz)
+        
+        if num_total_views % num_cams_in_npz != 0:
+            raise ValueError(
+                f"Total views ({num_total_views}) is not divisible by number of cameras ({num_cams_in_npz})"
+            )
+        
+        num_frames_in_npz = num_total_views // num_cams_in_npz
+        print(f"Loaded npz data: {num_frames_in_npz} frames, {num_cams_in_npz} cameras per frame")
+        print(f"  Total views: {num_total_views}")
+        print(f"  Depth shape: {depths.shape}")
+        print(f"  Image shape: {images.shape}")
+        
+        if num_frames is not None:
+            num_frames_to_render = min(num_frames, num_frames_in_npz)
+            pose_files = pose_files[:num_frames_to_render]
+        else:
+            num_frames_to_render = min(len(pose_files), num_frames_in_npz)
+            pose_files = pose_files[:num_frames_to_render]
+        
+        print(f"Will render {num_frames_to_render} frames")
+        
+        # Store data for per-frame processing
+        npz_data_dict = {
+            'images': images,
+            'depths': depths,
+            'extrinsics': extrinsics,
+            'intrinsics': intrinsics,
+            'conf': conf,
+            'num_cams_in_npz': num_cams_in_npz,
+            'num_total_views': num_total_views,
+        }
+        points_world_all = None
+        colors_all = None
+        
+    else:
+        # Mode 2: Accumulate all frames from cam_ids_in_npz together
+        print("="*60)
+        print("Mode: Accumulated point cloud (all frames from cam_ids_in_npz together)")
+        print("="*60)
+        
+        # Load npz data (without converting to point cloud yet)
+        print("Loading npz data...")
+        npz_data = load_npz_data(npz_path)
+        
+        images = npz_data['images']  # (N, H, W, 3) uint8
+        depths = npz_data['depths']  # (N, H, W)
+        extrinsics = npz_data['extrinsics']  # (N, 4, 4) or (N, 3, 4)
+        intrinsics = npz_data['intrinsics']  # (N, 3, 3)
+        conf = npz_data['conf']  # (N, H, W) or None
+        
+        num_total_views = depths.shape[0]
+        num_cams_in_npz = len(cam_ids_in_npz)
+        
+        if num_total_views % num_cams_in_npz != 0:
+            raise ValueError(
+                f"Total views ({num_total_views}) is not divisible by number of cameras ({num_cams_in_npz})"
+            )
+        
+        num_frames_in_npz = num_total_views // num_cams_in_npz
+        print(f"Loaded npz data: {num_frames_in_npz} frames, {num_cams_in_npz} cameras per frame")
+        print(f"  Total views: {num_total_views}")
+        print(f"  Depth shape: {depths.shape}")
+        print(f"  Image shape: {images.shape}")
+        print(f"  Accumulating point cloud from cameras: {cam_ids_in_npz}")
+        
+        # Extract only cam_ids_in_npz cameras from all frames and accumulate
+        print("Building point cloud from all frames (cam_ids_in_npz cameras only)...")
+        all_frame_depths = []
+        all_frame_images = []
+        all_frame_intrinsics = []
+        all_frame_extrinsics = []
+        all_frame_conf = [] if conf is not None else None
+        
+        for frame_idx in range(num_frames_in_npz):
+            for cam_idx, cam_id_npz in enumerate(cam_ids_in_npz):
+                view_idx = frame_idx * num_cams_in_npz + cam_idx
+                if view_idx >= num_total_views:
+                    raise ValueError(f"View index {view_idx} exceeds total views {num_total_views}")
+                
+                all_frame_depths.append(depths[view_idx])  # (H, W)
+                all_frame_images.append(images[view_idx])  # (H, W, 3)
+                all_frame_intrinsics.append(intrinsics[view_idx])  # (3, 3)
+                all_frame_extrinsics.append(extrinsics[view_idx])  # (4, 4) or (3, 4)
+                if conf is not None:
+                    all_frame_conf.append(conf[view_idx])  # (H, W)
+        
+        # Build accumulated point cloud from all frames (cam_ids_in_npz cameras only)
+        points_world_all, colors_all = depths_to_world_points_with_colors_single_frame(
+            all_frame_depths,
+            all_frame_intrinsics,
+            all_frame_extrinsics,
+            all_frame_images,
+            conf_list=all_frame_conf,
+            conf_thr=0.0
+        )
+        
+        if points_world_all.shape[0] == 0:
+            raise ValueError("No points found in accumulated point cloud!")
+        
+        print(f"Built accumulated point cloud: {points_world_all.shape[0]} points from {num_frames_in_npz} frames")
+        
+        if num_frames is not None:
+            num_frames_to_render = min(num_frames, num_frames_in_npz)
+            pose_files = pose_files[:num_frames_to_render]
+        else:
+            num_frames_to_render = min(len(pose_files), num_frames_in_npz)
+            pose_files = pose_files[:num_frames_to_render]
+        
+        print(f"Will render {num_frames_to_render} frames")
+        
+        npz_data_dict = None
     
     # Create output directories
     os.makedirs(output_dir, exist_ok=True)
@@ -500,35 +738,108 @@ def main():
     os.makedirs(rgb_images_dir, exist_ok=True)
     os.makedirs(mask_images_dir, exist_ok=True)
     
-    # Render each frame and save immediately
-    print("Rendering frames...")
+    # Render frames
     H, W = target_size[1], target_size[0]  # height, width
     
-    for frame_idx in tqdm(range(num_frames), desc="Rendering"):
-        # Load ego-to-world pose
-        ego_to_world = np.loadtxt(pose_files[frame_idx]).reshape(4, 4)
+    if use_single_frame_pointcloud:
+        # Mode 1: Build point cloud per frame
+        print("Rendering frames (building point cloud per frame)...")
         
-        # Compute world-to-camera transform
-        # Note: Point cloud from npz is in CV coordinate system, so we need to convert Waymo poses
-        world_to_camera = compute_world_to_camera_from_waymo(
-            cam_to_ego, ego_to_world, 
-            convert_coordinates=True,
-            camera_offset=camera_offset
-        )
+        images = npz_data_dict['images']
+        depths = npz_data_dict['depths']
+        extrinsics = npz_data_dict['extrinsics']
+        intrinsics = npz_data_dict['intrinsics']
+        conf = npz_data_dict['conf']
+        num_cams_in_npz = npz_data_dict['num_cams_in_npz']
+        num_total_views = npz_data_dict['num_total_views']
         
-        # Render view
-        rgb_image, mask = render_pointcloud_view(
-            points_world, colors, world_to_camera, K, (H, W)
-        )
+        for frame_idx in tqdm(range(num_frames_to_render), desc="Rendering"):
+            # Extract depth maps, images, intrinsics, extrinsics for this frame (all cameras)
+            frame_depths = []
+            frame_images = []
+            frame_intrinsics = []
+            frame_extrinsics = []
+            frame_conf = [] if conf is not None else None
+            
+            for cam_idx, cam_id_npz in enumerate(cam_ids_in_npz):
+                view_idx = frame_idx * num_cams_in_npz + cam_idx
+                if view_idx >= num_total_views:
+                    raise ValueError(f"View index {view_idx} exceeds total views {num_total_views}")
+                
+                frame_depths.append(depths[view_idx])  # (H, W)
+                frame_images.append(images[view_idx])  # (H, W, 3)
+                frame_intrinsics.append(intrinsics[view_idx])  # (3, 3)
+                frame_extrinsics.append(extrinsics[view_idx])  # (4, 4) or (3, 4)
+                if conf is not None:
+                    frame_conf.append(conf[view_idx])  # (H, W)
+            
+            # Build 3D point cloud from this frame's depth maps (all cameras)
+            points_world_frame, colors_frame = depths_to_world_points_with_colors_single_frame(
+                frame_depths,
+                frame_intrinsics,
+                frame_extrinsics,
+                frame_images,
+                conf_list=frame_conf,
+                conf_thr=0.0
+            )
+            
+            if points_world_frame.shape[0] == 0:
+                print(f"  Warning: No points found for frame {frame_idx}, creating empty image")
+                rgb_image = np.zeros((H, W, 3), dtype=np.uint8)
+                mask = np.zeros((H, W), dtype=np.uint8) * 255
+            else:
+                # Load ego-to-world pose for rendering camera
+                ego_to_world = np.loadtxt(pose_files[frame_idx]).reshape(4, 4)
+                
+                # Compute world-to-camera transform for rendering camera
+                world_to_camera = compute_world_to_camera_from_waymo(
+                    cam_to_ego_render, ego_to_world, 
+                    convert_coordinates=True,
+                    camera_offset=camera_offset
+                )
+                
+                # Render view using the point cloud from this frame
+                rgb_image, mask = render_pointcloud_view(
+                    points_world_frame, colors_frame, world_to_camera, K_render, (H, W)
+                )
+            
+            # Save images immediately
+            rgb_image_path = os.path.join(rgb_images_dir, f"frame_{frame_idx:05d}.jpg")
+            mask_image_path = os.path.join(mask_images_dir, f"frame_{frame_idx:05d}.png")
+            
+            # Convert RGB to BGR for OpenCV
+            rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(rgb_image_path, rgb_bgr)
+            cv2.imwrite(mask_image_path, mask)
+    
+    else:
+        # Mode 2: Use accumulated point cloud from all frames
+        print("Rendering frames (using accumulated point cloud from all frames)...")
         
-        # Save images immediately
-        rgb_image_path = os.path.join(rgb_images_dir, f"frame_{frame_idx:05d}.jpg")
-        mask_image_path = os.path.join(mask_images_dir, f"frame_{frame_idx:05d}.png")
-        
-        # Convert RGB to BGR for OpenCV
-        rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(rgb_image_path, rgb_bgr)
-        cv2.imwrite(mask_image_path, mask)
+        for frame_idx in tqdm(range(num_frames_to_render), desc="Rendering"):
+            # Load ego-to-world pose for rendering camera
+            ego_to_world = np.loadtxt(pose_files[frame_idx]).reshape(4, 4)
+            
+            # Compute world-to-camera transform for rendering camera
+            world_to_camera = compute_world_to_camera_from_waymo(
+                cam_to_ego_render, ego_to_world, 
+                convert_coordinates=True,
+                camera_offset=camera_offset
+            )
+            
+            # Render view using the accumulated point cloud from all frames
+            rgb_image, mask = render_pointcloud_view(
+                points_world_all, colors_all, world_to_camera, K_render, (H, W)
+            )
+            
+            # Save images immediately
+            rgb_image_path = os.path.join(rgb_images_dir, f"frame_{frame_idx:05d}.jpg")
+            mask_image_path = os.path.join(mask_images_dir, f"frame_{frame_idx:05d}.png")
+            
+            # Convert RGB to BGR for OpenCV
+            rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(rgb_image_path, rgb_bgr)
+            cv2.imwrite(mask_image_path, mask)
     
     # Create videos from saved images
     print("Creating videos from saved images...")
@@ -541,7 +852,7 @@ def main():
     mask_writer = cv2.VideoWriter(mask_video_path, fourcc, fps, (W, H), isColor=False)
     
     # Load and write images in order
-    for frame_idx in tqdm(range(num_frames), desc="Creating videos"):
+    for frame_idx in tqdm(range(num_frames_to_render), desc="Creating videos"):
         rgb_image_path = os.path.join(rgb_images_dir, f"frame_{frame_idx:05d}.jpg")
         mask_image_path = os.path.join(mask_images_dir, f"frame_{frame_idx:05d}.png")
         

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 # pip install tensorflow==2.11.0
-import tensorflow as tf
+# import tensorflow as tf
 
 CAMERA_NAME_TO_ID = {
     "front": 0,

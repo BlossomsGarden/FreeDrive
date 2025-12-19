@@ -46,8 +46,26 @@ python lidar_to_2d_image.py
 ```
 conda activate da3
 cd /data/wlh/DA3/code/Depth-Anything-3-main/src
-CUDA_VISIBLE_DEVICES=3 python infer_demo.py
+CUDA_VISIBLE_DEVICES=3 python da3_infer.py
 ```
+
+还会生成逐帧逐相机的深度图文件 .npz，可通过 render_from_npz.py 执行可视化，效果如下：
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><b>RGB FRONT</b></td>
+      <td align="center"><b>Point Cloud FRONT</b></td>
+      <td align="center"><b>Point Cloud FRONT (right+1m)</b></td>
+    </tr>
+    <tr>
+      <td><img src="assets/rgb_FRONT.gif" width="320"/></td>
+      <td><img src="assets/pcv_FRONT.gif" width="320"/></td>
+      <td><img src="assets/pcv_FRONT-right-1m.gif" width="320"/></td>
+    </tr>
+  </table>
+</div>
+
 
 ## Point Cloud Painter
 
@@ -66,13 +84,11 @@ bash inpaint_custom.sh
 - [x] [2025/12/12] WOD tfrecord to images/cam extrinsics scripts
 - [x] [2025/12/15] Reload scene from *.npz, get dense point cloud seq, unseen patch seq with given camera
 - [x] [2025/12/16] Test VideoPainter with custom mask/rgb video.
+- [x] [2025/12/19] Per-frame project with 3 cameras.
 - [ ] Construct fine-tune dataset
 - [ ] FID/NTA IoU scripts
 - [ ] Add reference frame/bbox branch and fine-tune
-- [ ] Possibility to align real-world metric
 - [ ] Possibility to change env settings
-- [ ] Possibility to explore per-frame point cloud and align
-- [ ] Possibility to support SIDE_LEFT/SIDE_RIGHT
 - [ ] Possibility to DIY cam extrinsics like Gen3C
 
 

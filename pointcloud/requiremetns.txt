@@ -1,0 +1,14 @@
+# 910B
+conda create -n da3 --clone PyTorch-2.1.0
+pip install moviepy==1.0.3 plyfile  trimesh evo e3nn fastapi uvicorn
+ 
+
+# 4090
+Wan
+moviepy==1.0.3
+plyfile
+pycolmap
+trimesh
+evo
+e3nn
+glob2

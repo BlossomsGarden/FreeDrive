@@ -492,6 +492,7 @@ class WaymoProcessor(object):
             self.save_dynamic_mask(frame, scene_name, frame_idx)
             if frame_idx == 0:
                 self.save_interested_labels(frame, scene_name)
+                
         self.save_videos(scene_name, limit)
 
     def __len__(self):
@@ -526,6 +527,7 @@ class WaymoProcessor(object):
 
     def save_image(self, frame, scene_name, frame_idx):
         """Parse and save the images in jpg format.
+        Saves original images to images_raw, and clipped images to images_clip.
 
         Args:
             frame (:obj:`Frame`): Open dataset frame proto.
@@ -533,12 +535,33 @@ class WaymoProcessor(object):
             frame_idx (int): Current frame index.
         """
         for img in frame.images:
-            img_path = (
-                f"{self.save_dir}/{scene_name}/images/"
-                + f"{str(frame_idx).zfill(3)}_{str(img.name - 1)}.jpg"
-            )
-            with open(img_path, "wb") as fp:
+            camera_id = img.name - 1
+            filename = f"{str(frame_idx).zfill(3)}_{camera_id}.jpg"
+            
+            # Save original image to images_raw
+            img_raw_path = f"{self.save_dir}/{scene_name}/images_raw/{filename}"
+            with open(img_raw_path, "wb") as fp:
                 fp.write(img.image)
+            
+            # Process and save clipped image to images_clip
+            img_clip_path = f"{self.save_dir}/{scene_name}/images_clip/{filename}"
+            img_array = np.frombuffer(img.image, dtype=np.uint8)
+            img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
+            if img_cv is not None:
+                h, w = img_cv.shape[:2]
+                if camera_id in [0, 1, 2]:
+                    # For camera_id 0, 1, 2 (1920x1280): crop top 394 pixels, keep bottom 1920x886
+                    if h == 1280 and w == 1920:
+                        cropped_img = img_cv[394:, :]
+                        cv2.imwrite(img_clip_path, cropped_img)
+                    else:
+                        cv2.imwrite(img_clip_path, img_cv)
+                elif camera_id in [3, 4]:
+                    # For camera_id 3, 4 (1920x886): keep as is
+                    cv2.imwrite(img_clip_path, img_cv)
+                else:
+                    cv2.imwrite(img_clip_path, img_cv)
 
     def save_calib(self, frame, scene_name, frame_idx):
         """Parse and save the calibration data.
@@ -644,7 +667,7 @@ class WaymoProcessor(object):
         for img in frame.images:
             # dynamic_mask
             img_path = (
-                f"{self.save_dir}/{scene_name}/images/"
+                f"{self.save_dir}/{scene_name}/images_raw/"
                 + f"{str(frame_idx).zfill(3)}_{str(img.name - 1)}.jpg"
             )
             img_shape = np.array(Image.open(img_path))
@@ -734,13 +757,13 @@ class WaymoProcessor(object):
             dynamic_mask.save(dynamic_mask_path)
 
     def save_videos(self, scene_name, num_frames):
-        """Create per-camera mp4 videos from saved images."""
+        """Create per-camera mp4 videos from saved images (using clipped images)."""
         os.makedirs(f"{self.save_dir}/{scene_name}/videos", exist_ok=True)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         for cam_id in range(len(self.cam_list)):
             first_frame_path = (
-                f"{self.save_dir}/{scene_name}/images/{str(0).zfill(3)}_{cam_id}.jpg"
+                f"{self.save_dir}/{scene_name}/images_raw/{str(0).zfill(3)}_{cam_id}.jpg"
             )
             if not os.path.exists(first_frame_path):
                 continue
@@ -755,7 +778,7 @@ class WaymoProcessor(object):
             # Write frames in order; skip missing frames silently.
             for idx in range(num_frames):
                 img_path = (
-                    f"{self.save_dir}/{scene_name}/images/{str(idx).zfill(3)}_{cam_id}.jpg"
+                    f"{self.save_dir}/{scene_name}/images_raw/{str(idx).zfill(3)}_{cam_id}.jpg"
                 )
                 img = cv2.imread(img_path)
                 if img is None:
@@ -767,7 +790,8 @@ class WaymoProcessor(object):
     def create_folder(self):
         """Create folder for data preprocessing."""
         for scene_name in self.scene_names:
-            os.makedirs(f"{self.save_dir}/{scene_name}/images", exist_ok=True)
+            os.makedirs(f"{self.save_dir}/{scene_name}/images_raw", exist_ok=True)
+            os.makedirs(f"{self.save_dir}/{scene_name}/images_clip", exist_ok=True)
             os.makedirs(
                 f"{self.save_dir}/{scene_name}/ego_pose",
                 exist_ok=True,
@@ -793,11 +817,10 @@ class WaymoProcessor(object):
                 exist_ok=True,
             )
 
-
 if __name__ == "__main__":
     processor = WaymoProcessor(
         load_dir="/data/wlh/FreeDrive/data/waymo/raw",
         save_dir="/data/wlh/FreeDrive/data/waymo/processed",
-        num_frames=49,
+        num_frames=None,    # None means process all frames
     )
     processor.convert()

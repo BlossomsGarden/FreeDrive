@@ -2,10 +2,12 @@
 根据 深度图、相机内参、相机外参、RGB图 导出特定格式3D点云的逻辑在 depth_anythin_3/utils/export/glb.py 中
 
 cd /data/wlh/DA3/code/Depth-Anything-3-main/src
-CUDA_VISIBLE_DEVICES=3 
+CUDA_VISIBLE_DEVICES=3 python da3_infer.py
+ASCEND_VISIBLE_DEVICES=0 python da3_infer.py
 
 100 帧 3 视角 336*504 MAX 46436MB
-60 帧 5视角 238*504 MAX 40558MB（有resize）
+60 帧 5视角 238*504 MAX 40558MB
+13 帧 3视角 504*1008 MAX 47246MB
 """
 
 import os
@@ -16,6 +18,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+
+# Try to import torch_npu for NPU 910B support
+try:
+    import torch_npu
+    HAS_NPU = True
+    print("✓ torch_npu imported successfully - using NPU 910B device")
+except ImportError:
+    HAS_NPU = False
+    print("✓ torch_npu not available - using CUDA/CPU device")
+
 from depth_anything_3.api import DepthAnything3
 from align_depth_with_lidar import process, ID_TO_CAMERA_NAME
 from depth_anything_3.utils.export import export
@@ -23,13 +35,39 @@ from depth_anything_3.utils.export import export
 # ------------------------------
 # Basic configuration
 # ------------------------------
-data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
-num_frames = 49
-# cam_ids = [3, 1, 0, 2, 4]  # 0, 1, 2, 3, 4 for FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
-cam_ids = [0, 1, 2]
+if HAS_NPU:
+    data_root = "/home/ma-user/modelarts/user-job-dir/wlh/data/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
+else:
+    data_root = "/data/wlh/FreeDrive/data/waymo/processed/individual_files_training_003s_segment-10061305430875486848_1080_000_1100_000_with_camera_labels"
+
+
+num_frames = 54
+cam_ids = [1, 0, 2]  # 0, 1, 2, 3, 4 for FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
+# cam_ids = [0, 1, 2]
+
+# 统一分辨率配置：目标分辨率 672x1008 (width x height)
+# process_res=1008 表示最长边缩放到 1008
+# lidar_target_resolution=(1008, 672) 表示 (H, W) = (height, width)
+# 这样在 lidar alignment 时会将所有数据（深度图、置信度图、lidar投影点）统一缩放到 672x1008
+# process_resolution = 504
+# lidar_target_resolution = (336, 504)  # (H, W) format for 336x504
+# process_resolution = 756
+# lidar_target_resolution = (504, 756)  # (H, W) format for 504x756
+process_resolution = 1008
+lidar_target_resolution = (672, 1008)  # (H, W) format for 672x1008
+    
 
 # Inference mode: True = use known camera poses (有参估计), False = estimate poses from model (无参估计)
+# 其实我想到一个问题：当你传入有参估计的时候，这不就是已经对齐了尺度吗？
+# 因为相机的尺度是真实的，那么为了保证结果可对齐，就会根据相机的尺度去匹配深度图让前后尽量能重合
+# 而相机尺度就是真实世界尺度，那我还align个毛线
 use_known_poses = True  # Set to False for pose-free estimation
+
+# Lidar alignment control: whether to perform lidar alignment (independent of use_known_poses)
+align_depth_with_lidar = False  # Set to True to enable lidar alignment
+
+# Chunk-based inference: number of frames to process per inference chunk (to avoid OOM)
+chunk_frame = 18  # Process chunk_frame frames at a time
 
 
 def load_intrinsics(intrinsics_dir: str, cam_ids, orig_size: Tuple[int, int], target_size: Tuple[int, int]):
@@ -142,7 +180,7 @@ def compute_world_to_camera(cam_to_ego: np.ndarray, ego_to_world: np.ndarray):
 # Prepare inputs
 # ------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    images_dir = os.path.join(data_root, "images")
+    images_dir = os.path.join(data_root, "images_raw")
     intrinsics_dir = os.path.join(data_root, "intrinsics")
     extrinsics_dir = os.path.join(data_root, "extrinsics")
     ego_pose_dir = os.path.join(data_root, "ego_pose")
@@ -211,52 +249,159 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------------------------
     # Run inference
     # ------------------------------------------------------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DepthAnything3.from_pretrained("/data/wlh/DA3/model/da3nested-giant-large")
+    # Auto-detect device: NPU 910B (if torch_npu available) or CUDA/CPU
+    device = torch.device("cpu")
+    if HAS_NPU:
+        model = DepthAnything3.from_pretrained("/home/ma-user/modelarts/user-job-dir/wlh/model/da3nested-giant-large")
+        device = torch.device("npu")
+        print(f"Using device: NPU 910B")
+    elif torch.cuda.is_available():
+        model = DepthAnything3.from_pretrained("/data/wlh/DA3/model/da3nested-giant-large")
+        device = torch.device("cuda")
+        print(f"Using device: CUDA")
+    
     model = model.to(device=device)
 
-    # 统一分辨率配置：目标分辨率 672x1008 (width x height)
-    # process_res=1008 表示最长边缩放到 1008
-    # lidar_target_resolution=(1008, 672) 表示 (H, W) = (height, width)
-    # 这样在 lidar alignment 时会将所有数据（深度图、置信度图、lidar投影点）统一缩放到 672x1008
-    process_resolution = 504
-    lidar_target_resolution = (336, 504)  # (H, W) format for 336x504
-    # process_resolution = 756
-    # lidar_target_resolution = (504, 756)  # (H, W) format for 504x756
-    # process_resolution = 1008
-    # lidar_target_resolution = (672, 1008)  # (H, W) format for 672x1008
+    num_cams = len(cam_ids)
+    num_chunks = (num_frames + chunk_frame - 1) // chunk_frame  # Ceiling division
     
-    # Run inference based on mode
-    if use_known_poses:
-        # 有参估计: 传入已知的相机内外参
-        prediction = model.inference(
-            images,
-            export_dir=None,
-            extrinsics=extrinsics_array,
-            intrinsics=intrinsics_array,
-            process_res=process_resolution,
-            process_res_method="upper_bound_resize"
-        )
-    else:
-        # 无参估计: 不传入相机参数，让模型估计
-        prediction = model.inference(
-            images,
-            export_dir=None,
-            process_res=process_resolution,
-            process_res_method="upper_bound_resize"
-        )
+    print("\n" + "="*60)
+    print(f"Chunk-based Inference Configuration")
+    print("="*60)
+    print(f"Total frames: {num_frames}")
+    print(f"Frames per chunk: {chunk_frame}")
+    print(f"Number of chunks: {num_chunks}")
+    print(f"Cameras per frame: {num_cams}")
+    print(f"Total images: {len(images)}")
+    
+    # Collect results from all chunks
+    all_depths = []
+    all_confs = []
+    all_skies = []
+    all_processed_images = []
+    all_extrinsics = []
+    all_intrinsics = []
+    
+    # Process each chunk
+    for chunk_idx in range(num_chunks):
+        start_frame = chunk_idx * chunk_frame
+        end_frame = min(start_frame + chunk_frame, num_frames)
+        chunk_num_frames = end_frame - start_frame
         
+        print(f"\n[Chunk {chunk_idx + 1}/{num_chunks}] Processing frames {start_frame} to {end_frame - 1} ({chunk_num_frames} frames)...")
+        
+        # Extract images for this chunk
+        chunk_images = []
+        for frame_idx in range(start_frame, end_frame):
+            for cam_id in cam_ids:
+                img_idx = frame_idx * num_cams + cam_ids.index(cam_id)
+                chunk_images.append(images[img_idx])
+        
+        # Extract camera parameters for this chunk (if using known poses)
+        chunk_extrinsics = None
+        chunk_intrinsics = None
+        if use_known_poses:
+            chunk_extrinsics_list = []
+            chunk_intrinsics_list = []
+            for frame_idx in range(start_frame, end_frame):
+                for cam_id in cam_ids:
+                    param_idx = frame_idx * num_cams + cam_ids.index(cam_id)
+                    chunk_extrinsics_list.append(extrinsics_array[param_idx])
+                    chunk_intrinsics_list.append(intrinsics_array[param_idx])
+            chunk_extrinsics = np.stack(chunk_extrinsics_list, axis=0)
+            chunk_intrinsics = np.stack(chunk_intrinsics_list, axis=0)
+        
+        # Run inference for this chunk
+        if use_known_poses:
+            # 有参估计: 传入已知的相机内外参
+            chunk_prediction = model.inference(
+                chunk_images,
+                export_dir=None,
+                extrinsics=chunk_extrinsics,
+                intrinsics=chunk_intrinsics,
+                process_res=process_resolution,
+                process_res_method="upper_bound_resize"
+            )
+        else:
+            # 无参估计: 不传入相机参数，让模型估计
+            chunk_prediction = model.inference(
+                chunk_images,
+                export_dir=None,
+                process_res=process_resolution,
+                process_res_method="upper_bound_resize"
+            )
+        
+        # Collect results from this chunk
+        all_depths.append(chunk_prediction.depth)
+        if chunk_prediction.conf is not None:
+            all_confs.append(chunk_prediction.conf)
+        if chunk_prediction.sky is not None:
+            all_skies.append(chunk_prediction.sky)
+        if chunk_prediction.processed_images is not None:
+            all_processed_images.append(chunk_prediction.processed_images)
+        if chunk_prediction.extrinsics is not None:
+            chunk_ext = np.asarray(chunk_prediction.extrinsics)
+            all_extrinsics.append(chunk_ext)
+        if chunk_prediction.intrinsics is not None:
+            chunk_int = np.asarray(chunk_prediction.intrinsics)
+            all_intrinsics.append(chunk_int)
+        
+        print(f"  Chunk {chunk_idx + 1} completed: {chunk_prediction.depth.shape[0]} views processed")
+    
+    # Merge all chunks
+    print("\n" + "="*60)
+    print("Merging results from all chunks...")
+    print("="*60)
+    
+    merged_depth = np.concatenate(all_depths, axis=0)
+    print(f"Merged depth shape: {merged_depth.shape}")
+    
+    merged_conf = None
+    if len(all_confs) > 0:
+        merged_conf = np.concatenate(all_confs, axis=0)
+        print(f"Merged confidence shape: {merged_conf.shape}")
+    
+    merged_sky = None
+    if len(all_skies) > 0:
+        merged_sky = np.concatenate(all_skies, axis=0)
+        print(f"Merged sky mask shape: {merged_sky.shape}")
+    
+    merged_processed_images = None
+    if len(all_processed_images) > 0:
+        merged_processed_images = np.concatenate(all_processed_images, axis=0)
+        print(f"Merged processed images shape: {merged_processed_images.shape}")
+    
+    merged_extrinsics = None
+    if len(all_extrinsics) > 0:
+        merged_extrinsics = np.concatenate(all_extrinsics, axis=0)
+        print(f"Merged extrinsics shape: {merged_extrinsics.shape}")
+    
+    merged_intrinsics = None
+    if len(all_intrinsics) > 0:
+        merged_intrinsics = np.concatenate(all_intrinsics, axis=0)
+        print(f"Merged intrinsics shape: {merged_intrinsics.shape}")
+    
+    # Create a unified prediction object
+    # We'll use the last chunk's prediction as a template and update its attributes
+    prediction = chunk_prediction
+    prediction.depth = merged_depth
+    prediction.conf = merged_conf
+    prediction.sky = merged_sky
+    prediction.processed_images = merged_processed_images
+    # Keep extrinsics and intrinsics as numpy arrays (not lists) as expected by export functions
+    if merged_extrinsics is not None:
+        prediction.extrinsics = merged_extrinsics
+    if merged_intrinsics is not None:
+        prediction.intrinsics = merged_intrinsics
+    
+    if not use_known_poses:
         # 打印模型估计的相机内外参
         print("\n" + "="*60)
         print("Model-estimated camera parameters (模型估计的相机参数)")
         print("="*60)
-        print(f"Extrinsics shape: {np.asarray(prediction.extrinsics).shape}")  # Camera poses (w2c): [N, 3, 4] or [N, 4, 4] float32
-        print(f"Intrinsics shape: {np.asarray(prediction.intrinsics).shape}")   # Camera intrinsics: [N, 3, 3] float32
-        print(f"Number of views: {len(prediction.extrinsics)}")
-        
-        # Convert extrinsics to numpy for easier inspection
-        pred_extrinsics = np.asarray(prediction.extrinsics)
-        pred_intrinsics = np.asarray(prediction.intrinsics)
+        print(f"Extrinsics shape: {merged_extrinsics.shape if merged_extrinsics is not None else 'None'}")  # Camera poses (w2c): [N, 3, 4] or [N, 4, 4] float32
+        print(f"Intrinsics shape: {merged_intrinsics.shape if merged_intrinsics is not None else 'None'}")   # Camera intrinsics: [N, 3, 3] float32
+        print(f"Number of views: {len(prediction.extrinsics) if prediction.extrinsics is not None else 0}")
 
 
     # ------------------------------------------------------------------------------------------------
@@ -264,7 +409,7 @@ if __name__ == "__main__":
     # Note: Lidar alignment requires known camera poses, so skip if pose-free estimation
     # ------------------------------------------------------------------------------------------------
     # Initialize output directory (used by both lidar alignment and GLB export)
-    output_base_dir = Path("output")
+    output_base_dir = Path("known_poses_output_5cam")
     
     # Validate inputs
     if prediction.depth is None or prediction.depth.ndim != 3:
@@ -276,7 +421,7 @@ if __name__ == "__main__":
         raise ValueError(
             f"Depth count ({total_views}) is not divisible by number of cameras ({num_cams})"
         )
-    num_frames = total_views // num_cams
+    num_frames_actual = total_views // num_cams
     
     # If target_resolution is None, use current depth resolution (no resize)
     if lidar_target_resolution is None:
@@ -284,8 +429,8 @@ if __name__ == "__main__":
     
     target_h, target_w = lidar_target_resolution
     
-    # Only perform lidar alignment if using known poses
-    if use_known_poses:
+    # Only perform lidar alignment if align_depth_with_lidar is True
+    if align_depth_with_lidar:
         print("\n" + "="*60)
         print("Starting Lidar Alignment (using known camera poses)")
         print("="*60)
@@ -304,7 +449,7 @@ if __name__ == "__main__":
         
         # 1) Save raw depths to per-camera npz files
         print(f"\n[Step 1] Saving raw depths to per-camera npz files...")
-        depths_reshaped = prediction.depth.reshape(num_frames, num_cams, H, W)
+        depths_reshaped = prediction.depth.reshape(num_frames_actual, num_cams, H, W)
         for cam_idx, cam_id in enumerate(cam_ids):
             npz_path = raw_dir / f"{cam_id}_depths.npz"
             np.savez_compressed(str(npz_path), depths=depths_reshaped[:, cam_idx].astype(np.float32))
@@ -334,7 +479,7 @@ if __name__ == "__main__":
             # Load and analyze lidar projection points for this camera to get range statistics
             if pre_dir.exists():
                 lidar_depths_all_frames = []
-                for frame_idx in range(num_frames):
+                for frame_idx in range(num_frames_actual):
                     npz_path = pre_dir / f"{frame_idx:03d}_{cam_id}.npz"
                     if npz_path.exists():
                         data = np.load(npz_path)
@@ -399,13 +544,13 @@ if __name__ == "__main__":
         # 4) Reconstruct aligned depths in original order (frame-major, then camera)
         print(f"\n[Step 4] Reconstructing aligned depths in original order...")
         aligned_depths = []
-        for frame_idx in range(num_frames):
+        for frame_idx in range(num_frames_actual):
             for cam_id in cam_ids:
                 cam_depths = aligned_per_cam[cam_id]
                 if frame_idx >= cam_depths.shape[0]:
                     raise ValueError(
                         f"Aligned depth frames for camera {cam_id} are fewer than expected "
-                        f"({cam_depths.shape[0]} < {num_frames})"
+                        f"({cam_depths.shape[0]} < {num_frames_actual})"
                     )
                 aligned_depths.append(cam_depths[frame_idx])
         
@@ -443,9 +588,9 @@ if __name__ == "__main__":
         print(f"\n✓ Lidar alignment completed!")
         print(f"  Aligned depths saved to: {npz_output_dir}")
     else:
-        # Skip alignment when using pose-free estimation
+        # Skip alignment when align_depth_with_lidar is False
         print("\n" + "="*60)
-        print("Skipping Lidar Alignment (pose-free estimation mode)")
+        print("Skipping Lidar Alignment (align_depth_with_lidar=False)")
         print("="*60)
         
         # Use original depths, but resize to target resolution if needed
@@ -517,14 +662,18 @@ if __name__ == "__main__":
             print("  Using model-estimated intrinsics (scaled to target resolution)")
         scale_x = target_w / float(W)
         scale_y = target_h / float(H)
-        for i in range(len(prediction.intrinsics)):
-            K = prediction.intrinsics[i].copy()
+        # Ensure intrinsics is numpy array
+        intrinsics_array = np.asarray(prediction.intrinsics)
+        for i in range(len(intrinsics_array)):
+            K = intrinsics_array[i].copy()
             K[0, 0] *= scale_x  # fx
             K[0, 2] *= scale_x  # cx
             K[1, 1] *= scale_y  # fy
             K[1, 2] *= scale_y  # cy
-            prediction.intrinsics[i] = K
-        print(f"  Updated intrinsics for {len(prediction.intrinsics)} views")
+            intrinsics_array[i] = K
+        # Keep as numpy array (as expected by export functions)
+        prediction.intrinsics = intrinsics_array
+        print(f"  Updated intrinsics for {len(intrinsics_array)} views")
 
 
 
