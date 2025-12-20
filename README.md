@@ -6,24 +6,34 @@
 FreeDrive
 ├── code
 │   ├── datasets
-│   │   ├── lidar_to_2d_image.py        # tools for lidar projector
-│   │   └── waymo_preprocess.py         # waymo dataset processor
+│   │   ├── waymo_lidar_to_2d_img.py            # waymo dataset lidar projector tool
+│   │   └── waymo_prepare.py                    # waymo dataset processor
 │   ├── pointcloud
-│   │   ├── depth_anything_3            # da3 official code
-│   │   ├── align_depth_with_lidar.py   # TODO: More specific alignment by SAM 3/Per-frame npz like Gen3C
-│   │   ├── render_from_npz.py          # export depth result to point cloud
-│   │   └── da3_infer.py                # main func
+│   │   ├── depth_anything_3                    # da3 official code
+│   │   ├── da3_infer.py                        # get per-frame depth using front 3 cameras 
+│   │   ├── point_cloud_painter_prepare.py      # construct train-dataset for PointCloudPainter 
+│   │   ├── render_from_npz.py                  # render point cloud video in given camera traj
+│   │   └── requiremetns.txt                    # 4090 / 910B environment
 │   └── video_painter_infer
 │       ├── diffusers
-│       ├── example                     # 示例输入输出与传参格式
+│       ├── example                             # i/o params demo
 │       ├── inpaint_custom.py           
-│       ├── inpaint_custom.sh           # 启动脚本
-│       └── requirements.txt            # 4090 推理依赖安装
+│       ├── inpaint_custom.sh                   # bash for customized input
+│       └── requirements.txt                    # 4090 environment
 └── data
     └── waymo
         ├── raw
         │   └── segment-10061305430875486848_1080_000_1100_000_with_camera_labels.tfrecord
         └── processed
+            └── segment-10061305430875486848_1080_000_1100_000_with_camera_labels
+                ├── dynamic_masks
+                ├── ego_pose
+                ├── extrinsics           
+                ├── images_clip                 # clip top pixels of FRONT 3 cameras to 1920*886 (Deprecated)
+                ├── images_raw
+                ├── intrinsics
+                ├── lidar_align                 # align depth with real-world scale (Deprecated)    
+                └── videos
 ```
 
 ## Data Preprocess
@@ -39,13 +49,14 @@ python waymo_preprocess.py
 ```
 python lidar_to_2d_image.py
 ```
+<img src="assets/lidar_viewer.png" width="960"/>
 
 ## Point Cloud
 
 借 depth anything 3 的深度估计和点云导出 utils，先推理、再对齐、最后导出为 .glb 可以直接双击查看
 ```
 conda activate da3
-cd /data/wlh/DA3/code/Depth-Anything-3-main/src
+cd /data/wlh/FreeDrive/code/pointcloud
 CUDA_VISIBLE_DEVICES=3 python da3_infer.py
 ```
 
@@ -56,12 +67,12 @@ CUDA_VISIBLE_DEVICES=3 python da3_infer.py
     <tr>
       <td align="center"><b>RGB FRONT</b></td>
       <td align="center"><b>Point Cloud FRONT</b></td>
-      <td align="center"><b>Point Cloud FRONT (right+1m)</b></td>
+      <td align="center"><b>Point Cloud FRONT (Right+1.5m)</b></td>
     </tr>
     <tr>
       <td><img src="assets/rgb_FRONT.gif" width="320"/></td>
       <td><img src="assets/pcv_FRONT.gif" width="320"/></td>
-      <td><img src="assets/pcv_FRONT-right-1m.gif" width="320"/></td>
+      <td><img src="assets/pcv_FRONT-right-1.5m.gif" width="320"/></td>
     </tr>
   </table>
 </div>
@@ -71,11 +82,35 @@ CUDA_VISIBLE_DEVICES=3 python da3_infer.py
 
 借 VideoPainter 做的 pipeline。使用时应注意 sh 文件中的各文件、模型路径与prompt。
 ```
-requirements.txt
+/video_painter_infer/requirements.txt
 conda activate videopainter
 cd /data/wlh/FreeDrive/code/video_painter_infer
 bash inpaint_custom.sh
 ```
+
+通过先使用数据集前三相机获得的点云获得某新轨迹下的三相机失真点云视频，再使用该失真点云视频获得的点云重新获得原 FRONT 轨迹下的失真点云视频，
+并记录 mask，结合数据集中的 FRONT 驾驶视频，就构建出了一个 occlusion/mask/GT 的训练数据。
+```
+/pointcloud/requirements.txt
+conda activate da3
+cd /data/wlh/FreeDrive/code/pointcloud
+CUDA_VISIBLE_DEVICES=3 python point_cloud_painter_prepare.py
+```
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><b>Point Cloud FRONT (Right+1.5m)</b></td>
+      <td align="center"><b>Reprojected Point Cloud FRONT</b></td>
+      <td align="center"><b>Reprojected Mask FRONT</b></td>
+    </tr>
+    <tr>
+      <td><img src="assets/pcv_FRONT-right-1.5m.gif" width="320"/></td>
+      <td><img src="assets/re_pcv_FRONT.gif" width="320"/></td>
+      <td><img src="assets/re_mask_FRONT.gif" width="320"/></td>
+    </tr>
+  </table>
+</div>
 
 
 ## TODO

@@ -12,10 +12,8 @@ ASCEND_VISIBLE_DEVICES=0 python da3_infer.py
 
 import os
 from glob import glob
-import json
 from typing import Tuple
 from pathlib import Path
-import cv2
 import numpy as np
 import torch
 
@@ -29,7 +27,6 @@ except ImportError:
     print("✓ torch_npu not available - using CUDA/CPU device")
 
 from depth_anything_3.api import DepthAnything3
-from align_depth_with_lidar import process, ID_TO_CAMERA_NAME
 from depth_anything_3.utils.export import export
 
 # ------------------------------
@@ -43,28 +40,16 @@ else:
 
 num_frames = 54
 cam_ids = [1, 0, 2]  # 0, 1, 2, 3, 4 for FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT
-# cam_ids = [0, 1, 2]
 
-# 统一分辨率配置：目标分辨率 672x1008 (width x height)
-# process_res=1008 表示最长边缩放到 1008
-# lidar_target_resolution=(1008, 672) 表示 (H, W) = (height, width)
-# 这样在 lidar alignment 时会将所有数据（深度图、置信度图、lidar投影点）统一缩放到 672x1008
-# process_resolution = 504
-# lidar_target_resolution = (336, 504)  # (H, W) format for 336x504
-# process_resolution = 756
-# lidar_target_resolution = (504, 756)  # (H, W) format for 504x756
+# Waymo raw camera resolution (use actual if known; defaults to 1920x1280).
+orig_w, orig_h = 1920, 1280
+
+# Inference resolution configuration
+# process_res=1008 表示最长边缩放到 1008  即 (1920, 1280) -> (1008, 672)
 process_resolution = 1008
-lidar_target_resolution = (672, 1008)  # (H, W) format for 672x1008
-    
 
 # Inference mode: True = use known camera poses (有参估计), False = estimate poses from model (无参估计)
-# 其实我想到一个问题：当你传入有参估计的时候，这不就是已经对齐了尺度吗？
-# 因为相机的尺度是真实的，那么为了保证结果可对齐，就会根据相机的尺度去匹配深度图让前后尽量能重合
-# 而相机尺度就是真实世界尺度，那我还align个毛线
 use_known_poses = True  # Set to False for pose-free estimation
-
-# Lidar alignment control: whether to perform lidar alignment (independent of use_known_poses)
-align_depth_with_lidar = False  # Set to True to enable lidar alignment
 
 # Chunk-based inference: number of frames to process per inference chunk (to avoid OOM)
 chunk_frame = 18  # Process chunk_frame frames at a time
@@ -202,8 +187,6 @@ if __name__ == "__main__":
     with Image.open(sample_image) as im:
         target_w, target_h = im.size
 
-    # Waymo raw camera resolution (use actual if known; defaults to 1920x1280).
-    orig_w, orig_h = 1920, 1280
 
     # Load camera parameters only if using known poses (有参估计)
     extrinsics_array = None
@@ -405,275 +388,14 @@ if __name__ == "__main__":
 
 
     # ------------------------------------------------------------------------------------------------
-    # Lidar alignment (manually implemented)
-    # Note: Lidar alignment requires known camera poses, so skip if pose-free estimation
+    # Prepare for export
     # ------------------------------------------------------------------------------------------------
-    # Initialize output directory (used by both lidar alignment and GLB export)
+    # Initialize output directory
     output_base_dir = Path("known_poses_output_5cam")
     
     # Validate inputs
     if prediction.depth is None or prediction.depth.ndim != 3:
         raise ValueError("prediction.depth must be a 3D array (N, H, W)")
-    
-    num_cams = len(cam_ids)
-    total_views, H, W = prediction.depth.shape
-    if total_views % num_cams != 0:
-        raise ValueError(
-            f"Depth count ({total_views}) is not divisible by number of cameras ({num_cams})"
-        )
-    num_frames_actual = total_views // num_cams
-    
-    # If target_resolution is None, use current depth resolution (no resize)
-    if lidar_target_resolution is None:
-        lidar_target_resolution = (H, W)  # Use current resolution
-    
-    target_h, target_w = lidar_target_resolution
-    
-    # Only perform lidar alignment if align_depth_with_lidar is True
-    if align_depth_with_lidar:
-        print("\n" + "="*60)
-        print("Starting Lidar Alignment (using known camera poses)")
-        print("="*60)
-        
-        # Configuration for lidar alignment
-        lidar_frame_offset = 0
-        lidar_save_png = True
-        lidar_colormap = "inferno"
-        ri_index = 0  # Use first return
-    
-        # Create directories for raw and aligned depths
-        raw_dir = output_base_dir / "aligned_depths" / "raw"
-        aligned_dir = output_base_dir / "aligned_depths" / "aligned"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        aligned_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 1) Save raw depths to per-camera npz files
-        print(f"\n[Step 1] Saving raw depths to per-camera npz files...")
-        depths_reshaped = prediction.depth.reshape(num_frames_actual, num_cams, H, W)
-        for cam_idx, cam_id in enumerate(cam_ids):
-            npz_path = raw_dir / f"{cam_id}_depths.npz"
-            np.savez_compressed(str(npz_path), depths=depths_reshaped[:, cam_idx].astype(np.float32))
-            print(f"  Saved raw depths for camera {cam_id}: {depths_reshaped[:, cam_idx].shape}")
-        
-        # 2) Run lidar alignment using align_depth_with_lidar.process for each camera
-        print(f"\n[Step 2] Running lidar alignment for each camera...")
-        data_root_path = Path(data_root)
-        
-        # Check for precomputed lidar projections directory
-        pre_dir = data_root_path / "lidar_align"
-        if not pre_dir.exists():
-            print(f"  Warning: Precomputed lidar projections directory not found: {pre_dir}")
-            print(f"  Lidar range statistics will not be available.")
-        
-        for cam_idx, cam_id in enumerate(cam_ids):
-            # Convert camera ID to camera name
-            camera_name = ID_TO_CAMERA_NAME.get(cam_id, f"camera_{cam_id}")
-            if cam_id not in ID_TO_CAMERA_NAME:
-                print(f"  Warning: Camera ID {cam_id} not in ID_TO_CAMERA_NAME mapping, using 'camera_{cam_id}'")
-            
-            depth_npz_path = raw_dir / f"{cam_id}_depths.npz"
-            output_cam_dir = aligned_dir / f"cam_{cam_id}"
-            
-            print(f"  Processing camera {cam_id} ({camera_name})...")
-            
-            # Load and analyze lidar projection points for this camera to get range statistics
-            if pre_dir.exists():
-                lidar_depths_all_frames = []
-                for frame_idx in range(num_frames_actual):
-                    npz_path = pre_dir / f"{frame_idx:03d}_{cam_id}.npz"
-                    if npz_path.exists():
-                        data = np.load(npz_path)
-                        if "projected" in data:
-                            projected_points = data["projected"]
-                            # projected_points shape: (N, 3) where columns are [x, y, z] and z is depth
-                            if projected_points.shape[1] >= 3:
-                                lidar_depths = projected_points[:, 2]  # Extract depth (z) values
-                                # Filter valid depths (finite and positive)
-                                valid_depths = lidar_depths[np.isfinite(lidar_depths) & (lidar_depths > 0)]
-                                if len(valid_depths) > 0:
-                                    lidar_depths_all_frames.append(valid_depths)
-                
-                if len(lidar_depths_all_frames) > 0:
-                    # Concatenate all valid depths across all frames for this camera
-                    all_lidar_depths = np.concatenate(lidar_depths_all_frames)
-                    min_depth = float(np.min(all_lidar_depths))
-                    max_depth = float(np.max(all_lidar_depths))
-                    mean_depth = float(np.mean(all_lidar_depths))
-                    median_depth = float(np.median(all_lidar_depths))
-                    num_points = len(all_lidar_depths)
-                    print(f"    LiDAR range for camera {cam_id} ({camera_name}):")
-                    print(f"      - Min depth: {min_depth:.3f} m")
-                    print(f"      - Max depth: {max_depth:.3f} m")
-                    print(f"      - Mean depth: {mean_depth:.3f} m")
-                    print(f"      - Median depth: {median_depth:.3f} m")
-                    print(f"      - Total valid points: {num_points}")
-                else:
-                    print(f"    Warning: No valid LiDAR points found for camera {cam_id} ({camera_name})")
-            else:
-                print(f"    Skipping LiDAR range statistics (precomputed projections not found)")
-            
-            try:
-                process(
-                    depth_npz_path=depth_npz_path,
-                    output_dir=output_cam_dir,
-                    camera_name=camera_name,
-                    ri_index=ri_index,
-                    file_index=cam_idx,
-                    total_files=num_cams,
-                    data_root=data_root_path,
-                    save_raw_overlay=lidar_save_png,
-                    save_aligned_overlay=lidar_save_png,
-                    target_resolution=lidar_target_resolution,
-                )
-            except Exception as e:
-                print(f"  Error: Failed to process camera {cam_id}: {e}")
-                raise
-        
-        # 3) Load aligned depths from output files
-        print(f"\n[Step 3] Loading aligned depths from output files...")
-        aligned_per_cam = {}
-        for cam_id in cam_ids:
-            aligned_path = aligned_dir / f"cam_{cam_id}" / f"{cam_id}_depths.npz"
-            if not aligned_path.exists():
-                raise FileNotFoundError(
-                    f"Aligned depth file not found for camera {cam_id}: {aligned_path}"
-                )
-            aligned_per_cam[cam_id] = np.load(str(aligned_path))["depths"]
-            print(f"  Loaded aligned depths for camera {cam_id}: {aligned_per_cam[cam_id].shape}")
-        
-        # 4) Reconstruct aligned depths in original order (frame-major, then camera)
-        print(f"\n[Step 4] Reconstructing aligned depths in original order...")
-        aligned_depths = []
-        for frame_idx in range(num_frames_actual):
-            for cam_id in cam_ids:
-                cam_depths = aligned_per_cam[cam_id]
-                if frame_idx >= cam_depths.shape[0]:
-                    raise ValueError(
-                        f"Aligned depth frames for camera {cam_id} are fewer than expected "
-                        f"({cam_depths.shape[0]} < {num_frames_actual})"
-                    )
-                aligned_depths.append(cam_depths[frame_idx])
-        
-        aligned_depth_array = np.stack(aligned_depths, axis=0).astype(np.float32)
-        
-        # 5) Resize depth and confidence to target resolution if needed
-        if aligned_depth_array.shape[1:] != (target_h, target_w):
-            print(f"\n[Step 5] Resizing depths from {aligned_depth_array.shape[1:]} to {(target_h, target_w)}...")
-            resized_depths = []
-            for i in range(aligned_depth_array.shape[0]):
-                depth_frame = aligned_depth_array[i]
-                if depth_frame.shape[0] < target_h or depth_frame.shape[1] < target_w:
-                    interpolation = cv2.INTER_CUBIC
-                else:
-                    interpolation = cv2.INTER_AREA
-                resized = cv2.resize(depth_frame, (target_w, target_h), interpolation=interpolation)
-                resized_depths.append(resized)
-            aligned_depth_array = np.stack(resized_depths, axis=0)
-        
-        # Update prediction with aligned depths
-        prediction.depth = aligned_depth_array
-        print(f"  Updated prediction.depth with aligned scales: {prediction.depth.shape}")
-        
-        # 10) Save aligned depths as npz file
-        print(f"\n[Step 10] Saving aligned depths as npz file...")
-        npz_output_dir = output_base_dir / "aligned_depths_npz"
-        npz_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save per-camera npz files
-        for cam_id in cam_ids:
-            npz_path = npz_output_dir / f"{cam_id}_depths.npz"
-            np.savez_compressed(str(npz_path), depths=aligned_per_cam[cam_id].astype(np.float32))
-            print(f"  Saved aligned depths for camera {cam_id}: {aligned_per_cam[cam_id].shape} -> {npz_path}")
-        
-        print(f"\n✓ Lidar alignment completed!")
-        print(f"  Aligned depths saved to: {npz_output_dir}")
-    else:
-        # Skip alignment when align_depth_with_lidar is False
-        print("\n" + "="*60)
-        print("Skipping Lidar Alignment (align_depth_with_lidar=False)")
-        print("="*60)
-        
-        # Use original depths, but resize to target resolution if needed
-        if prediction.depth.shape[1:] != (target_h, target_w):
-            print(f"\nResizing depths from {prediction.depth.shape[1:]} to {(target_h, target_w)}...")
-            resized_depths = []
-            for i in range(prediction.depth.shape[0]):
-                depth_frame = prediction.depth[i]
-                if depth_frame.shape[0] < target_h or depth_frame.shape[1] < target_w:
-                    interpolation = cv2.INTER_CUBIC
-                else:
-                    interpolation = cv2.INTER_AREA
-                resized = cv2.resize(depth_frame, (target_w, target_h), interpolation=interpolation)
-                resized_depths.append(resized)
-            prediction.depth = np.stack(resized_depths, axis=0).astype(np.float32)
-            print(f"  Updated prediction.depth: {prediction.depth.shape}")
-    
-    # Resize confidence map if it exists
-    if prediction.conf is not None:
-        if prediction.conf.shape[1:] != (target_h, target_w):
-            print(f"\nResizing confidence from {prediction.conf.shape[1:]} to {(target_h, target_w)}...")
-            resized_confs = []
-            for i in range(prediction.conf.shape[0]):
-                conf_frame = prediction.conf[i]
-                if conf_frame.shape[0] < target_h or conf_frame.shape[1] < target_w:
-                    interpolation = cv2.INTER_CUBIC
-                else:
-                    interpolation = cv2.INTER_AREA
-                resized = cv2.resize(conf_frame, (target_w, target_h), interpolation=interpolation)
-                resized_confs.append(resized)
-            prediction.conf = np.stack(resized_confs, axis=0)
-            print(f"  Updated prediction.conf: {prediction.conf.shape}")
-    
-    # Resize sky mask if it exists
-    if prediction.sky is not None:
-        if prediction.sky.shape[1:] != (target_h, target_w):
-            print(f"\nResizing sky mask from {prediction.sky.shape[1:]} to {(target_h, target_w)}...")
-            resized_skies = []
-            for i in range(prediction.sky.shape[0]):
-                sky_frame = prediction.sky[i]
-                resized = cv2.resize(sky_frame, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-                resized_skies.append(resized)
-            prediction.sky = np.stack(resized_skies, axis=0)
-            print(f"  Updated prediction.sky: {prediction.sky.shape}")
-    
-    # Resize processed_images if they exist
-    if prediction.processed_images is not None:
-        if prediction.processed_images.shape[1:3] != (target_h, target_w):
-            print(f"\nResizing processed_images from {prediction.processed_images.shape[1:3]} to {(target_h, target_w)}...")
-            resized_images = []
-            for i in range(prediction.processed_images.shape[0]):
-                img_frame = prediction.processed_images[i]  # (H, W, 3)
-                if img_frame.shape[0] < target_h or img_frame.shape[1] < target_w:
-                    interpolation = cv2.INTER_CUBIC
-                else:
-                    interpolation = cv2.INTER_AREA
-                resized = cv2.resize(img_frame, (target_w, target_h), interpolation=interpolation)
-                resized_images.append(resized)
-            prediction.processed_images = np.stack(resized_images, axis=0)
-            print(f"  Updated prediction.processed_images: {prediction.processed_images.shape}")
-    
-    # Update intrinsics if resolution changed
-    # Note: In pose-free mode, we use model-estimated intrinsics; in known poses mode, we use loaded intrinsics
-    if prediction.intrinsics is not None and (H, W) != (target_h, target_w):
-        print(f"\nUpdating intrinsics from {(H, W)} to {(target_h, target_w)}...")
-        if use_known_poses:
-            print("  Using known intrinsics (scaled to target resolution)")
-        else:
-            print("  Using model-estimated intrinsics (scaled to target resolution)")
-        scale_x = target_w / float(W)
-        scale_y = target_h / float(H)
-        # Ensure intrinsics is numpy array
-        intrinsics_array = np.asarray(prediction.intrinsics)
-        for i in range(len(intrinsics_array)):
-            K = intrinsics_array[i].copy()
-            K[0, 0] *= scale_x  # fx
-            K[0, 2] *= scale_x  # cx
-            K[1, 1] *= scale_y  # fy
-            K[1, 2] *= scale_y  # cy
-            intrinsics_array[i] = K
-        # Keep as numpy array (as expected by export functions)
-        prediction.intrinsics = intrinsics_array
-        print(f"  Updated intrinsics for {len(intrinsics_array)} views")
 
 
 
