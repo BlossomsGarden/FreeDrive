@@ -7,12 +7,12 @@
 model_path="/data/wlh/FreeDrive/model/CogVideoX-5b-I2V"
 inpainting_branch="/data/wlh/FreeDrive/model/VideoPainter/VideoPainter/checkpoints/branch"
 id_adapter_resample_learnable_path="/data/wlh/FreeDrive/model/VideoPainter/VideoPainterID/checkpoints"
-rgb_video_path="/data/wlh/FreeDrive/code/video_painter/video_painter_infer/example/rgb_video.mp4"
+rgb_video_path="/data/wlh/FreeDrive/code/video_painter/video_painter_infer/example/occluded_images.mp4"
 # Mask path (REQUIRED) - can be:
 #   - Video file: .mp4, .avi, etc.
 #   - Numpy array: .npz, .npy
 #   - Directory: folder containing mask images (.png, .jpg)
-mask_video_path="/data/wlh/FreeDrive/code/video_painter/video_painter_infer/example/mask_video.mp4"
+mask_video_path="/data/wlh/FreeDrive/code/video_painter/video_painter_infer/example/occluded_masks.mp4"
 prompt="This scene is set on an urban road, but some elements such as vehicles, roadside trees, the road itself, and buildings are missing or contain artifacts, requiring inpainting restoration."
 output_path="output.mp4"
 

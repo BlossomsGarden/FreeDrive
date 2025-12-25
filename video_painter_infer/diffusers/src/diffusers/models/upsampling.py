@@ -378,10 +378,28 @@ class CogVideoXUpsample3D(nn.Module):
     ) -> None:
         super().__init__()
 
+        # DAMN YOU #
+        # FUCK YOU NPU nn.conv2D#
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         self.compress_time = compress_time
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+
+
+
+
+        # # Cast to float32/float16 for NPU compatibility - NPU's interpolate doesn't support bfloat16
+        # # Similar to Upsample2D, we need to handle bfloat16 dtype conversion
+        # original_dtype = inputs.dtype
+        # needs_cast = original_dtype == torch.bfloat16
+        
+        # if needs_cast:
+        #     # Convert to float32 for NPU compatibility (float16 may also work, but float32 is safer)
+        #     inputs = inputs.to(torch.float32)
+        
+
+
+
         if self.compress_time:
             if inputs.shape[2] > 1 and inputs.shape[2] % 2 == 1:
                 # split first frame
@@ -406,8 +424,42 @@ class CogVideoXUpsample3D(nn.Module):
 
         b, c, t, h, w = inputs.shape
         inputs = inputs.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+
+        
+        # print("inputs.device:", inputs.device)
+        # print("inputs.dtype:", inputs.dtype)
+        # print("inputs.shape:", inputs.shape)
+        # print("self.conv.weight.device:", self.conv.weight.device)
+
+        # # Ensure conv layer weights are loaded from meta device before forward pass
+        # # When using enable_sequential_cpu_offload(), weights may be on 'meta' device.
+        # # We need to trigger accelerate's hook to load weights to the actual device.
+        # # This prevents Segmentation fault when NPU tries to use meta device weights.
+        # if hasattr(self.conv, "_hf_hook") and hasattr(self.conv._hf_hook, "pre_forward"):
+        #     # Trigger accelerate's hook to load weights from meta device if needed
+        #     self.conv._hf_hook.pre_forward(self.conv)
+        # elif self.conv.weight.device.type == "meta":
+        #     # Fallback: if hook doesn't exist but weight is on meta, try to move module to input device
+        #     # This should trigger accelerate to load the weights
+        #     self.conv.to(inputs.device)
+
+        # 检查 self.conv 在计算时，inputs的权重的dtype与device
+        # print("Before self.conv: inputs.device =", inputs.device, "| inputs.dtype =", inputs.dtype)
+        # print("self.conv.weight.device =", self.conv.weight.device, "| self.conv.weight.dtype =", self.conv.weight.dtype)
+        # FUCK YOU NPU nn.conv2D#
+        # EZ9999: [PID: 118146] 2025-12-22-22:22:53.542.165 input datatype must be uint8 float16,float or double!
         inputs = self.conv(inputs)
         inputs = inputs.reshape(b, t, *inputs.shape[1:]).permute(0, 2, 1, 3, 4)
+        
+        # print("inputs.device:", inputs.device)
+
+
+
+        # # Cast back to original dtype if we converted it
+        # if needs_cast:
+        #     inputs = inputs.to(original_dtype)
+
+
 
         return inputs
 

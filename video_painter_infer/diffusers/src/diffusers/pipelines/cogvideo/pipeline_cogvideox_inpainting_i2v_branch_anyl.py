@@ -1069,9 +1069,11 @@ class CogVideoXI2VDualInpaintAnyLPipeline(DiffusionPipeline, CogVideoXLoraLoader
                 frame_accumulator[:, i] /= frame_counts[i]
 
         if not output_type == "latent":
+            print("decoding latents to video")
             video = self.decode_latents(frame_accumulator)
             video = self.video_processor.postprocess_video(video=video, output_type=output_type)
         else:
+            print("not decoding and return latent directly.")
             video = frame_accumulator
 
         # Offload all models

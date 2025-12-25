@@ -1,0 +1,37 @@
+# 910B
+conda create -n da3 --clone PyTorch-2.1.0
+conda activate da3
+pip install moviepy==1.0.3 plyfile  trimesh evo e3nn fastapi uvicorn
+
+# 910B 同机转运
+cd /home/ma-user/modelarts/user-job-dir
+mkdir wlh
+cd wlh
+mkdir data
+mkdir code
+mkdir model
+cd data
+mkdir PCP_trainer
+
+cd /home/ma-user/modelarts/user-job-dir/wlh/model
+mkdir -p da3nested-giant-large
+mv * da3nested-giant-large/
+
+
+nohup scp -P 2222 -r  RANK0  RANK1 RANK2 RANK3 RANK4  RANK5 RANK6 RANK7    ma-user@ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be-worker-3.ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be:/home/ma-user/modelarts/user-job-dir/wlh/data/  > 0-7.log 2>&1 &
+scp -P 2222 -r    /home/ma-user/modelarts/user-job-dir/wlh/model/da3nested-giant-large/   ma-user@ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be-worker-3.ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be:/home/ma-user/modelarts/user-job-dir/wlh/model
+scp -P 2222 -r    /home/ma-user/modelarts/user-job-dir/wlh/code/FreeDrive/pointcloud/910B-scripts/   ma-user@ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be-worker-1.ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be:/home/ma-user/modelarts/user-job-dir/wlh/code
+
+
+scp -P 2222 -r    RANK*   ma-user@ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be-worker-0.ma-job-d7d06141-ab9f-474d-ba95-c8ef5939b0be:/home/ma-user/modelarts/user-job-dir/wlh/code/
+
+
+
+# 4090
+Wan
+moviepy==1.0.3
+plyfile
+pycolmap
+trimesh
+evo
+e3nn

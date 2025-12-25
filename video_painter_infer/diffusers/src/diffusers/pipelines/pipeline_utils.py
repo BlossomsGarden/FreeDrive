@@ -404,13 +404,13 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
 
             return hasattr(module, "_hf_hook") and isinstance(module._hf_hook, accelerate.hooks.CpuOffload)
 
-        # .to("cuda") would raise an error if the pipeline is sequentially offloaded, so we raise our own to make it clearer
+        # .to("cuda"/"npu") would raise an error if the pipeline is sequentially offloaded, so we raise our own to make it clearer
         pipeline_is_sequentially_offloaded = any(
             module_is_sequentially_offloaded(module) for _, module in self.components.items()
         )
-        if pipeline_is_sequentially_offloaded and device and torch.device(device).type == "cuda":
+        if pipeline_is_sequentially_offloaded and device and torch.device(device).type in ("cuda", "npu"):
             raise ValueError(
-                "It seems like you have activated sequential model offloading by calling `enable_sequential_cpu_offload`, but are now attempting to move the pipeline to GPU. This is not compatible with offloading. Please, move your pipeline `.to('cpu')` or consider removing the move altogether if you use sequential offloading."
+                "It seems like you have activated sequential model offloading by calling `enable_sequential_cpu_offload`, but are now attempting to move the pipeline to GPU/NPU. This is not compatible with offloading. Please, move your pipeline `.to('cpu')` or consider removing the move altogether if you use sequential offloading."
             )
 
         is_pipeline_device_mapped = self.hf_device_map is not None and len(self.hf_device_map) > 1
@@ -421,9 +421,10 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
 
         # Display a warning in this case (the operation succeeds but the benefits are lost)
         pipeline_is_offloaded = any(module_is_offloaded(module) for _, module in self.components.items())
-        if pipeline_is_offloaded and device and torch.device(device).type == "cuda":
+        if pipeline_is_offloaded and device and torch.device(device).type in ("cuda", "npu"):
+            device_type = torch.device(device).type.upper()
             logger.warning(
-                f"It seems like you have activated model offloading by calling `enable_model_cpu_offload`, but are now manually moving the pipeline to GPU. It is strongly recommended against doing so as memory gains from offloading are likely to be lost. Offloading automatically takes care of moving the individual components {', '.join(self.components.keys())} to GPU when needed. To make sure offloading works as expected, you should consider moving the pipeline back to CPU: `pipeline.to('cpu')` or removing the move altogether if you use offloading."
+                f"It seems like you have activated model offloading by calling `enable_model_cpu_offload`, but are now manually moving the pipeline to {device_type}. It is strongly recommended against doing so as memory gains from offloading are likely to be lost. Offloading automatically takes care of moving the individual components {', '.join(self.components.keys())} to {device_type} when needed. To make sure offloading works as expected, you should consider moving the pipeline back to CPU: `pipeline.to('cpu')` or removing the move altogether if you use offloading."
             )
 
         module_names, _ = self._get_signature_keys(self)
@@ -962,19 +963,19 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
                 accelerate.hooks.remove_hook_from_module(model, recurse=True)
         self._all_hooks = []
 
-    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
+    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = None):
         r"""
         Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
-        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
-        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
+        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU/NPU when its `forward`
+        method is called, and the model remains in GPU/NPU until the next model runs. Memory savings are lower than with
         `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
 
         Arguments:
             gpu_id (`int`, *optional*):
                 The ID of the accelerator that shall be used in inference. If not specified, it will default to 0.
-            device (`torch.Device` or `str`, *optional*, defaults to "cuda"):
+            device (`torch.Device` or `str`, *optional*):
                 The PyTorch device type of the accelerator that shall be used in inference. If not specified, it will
-                default to "cuda".
+                default to "npu" if NPU is available, otherwise "cuda".
         """
         is_pipeline_device_mapped = self.hf_device_map is not None and len(self.hf_device_map) > 1
         if is_pipeline_device_mapped:
@@ -994,6 +995,13 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
 
         self.remove_all_hooks()
 
+        # Auto-detect device if not specified: prefer NPU if available, otherwise CUDA
+        if device is None:
+            if is_torch_npu_available():
+                device = "npu"
+            else:
+                device = "cuda"
+        
         torch_device = torch.device(device)
         device_index = torch_device.index
 
@@ -1052,9 +1060,15 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
             return
 
         # make sure the model is in the same state as before calling it
-        self.enable_model_cpu_offload(device=getattr(self, "_offload_device", "cuda"))
+        # Auto-detect device if not set: prefer NPU if available, otherwise CUDA
+        default_device = "cuda"
+        if hasattr(self, "_offload_device"):
+            default_device = str(self._offload_device)
+        elif is_torch_npu_available():
+            default_device = "npu"
+        self.enable_model_cpu_offload(device=default_device)
 
-    def enable_sequential_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
+    def enable_sequential_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = None):
         r"""
         Offloads all models to CPU using 🤗 Accelerate, significantly reducing memory usage. When called, the state
         dicts of all `torch.nn.Module` components (except those in `self._exclude_from_cpu_offload`) are saved to CPU
@@ -1065,9 +1079,9 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
         Arguments:
             gpu_id (`int`, *optional*):
                 The ID of the accelerator that shall be used in inference. If not specified, it will default to 0.
-            device (`torch.Device` or `str`, *optional*, defaults to "cuda"):
+            device (`torch.Device` or `str`, *optional*):
                 The PyTorch device type of the accelerator that shall be used in inference. If not specified, it will
-                default to "cuda".
+                default to "npu" if NPU is available, otherwise "cuda".
         """
         if is_accelerate_available() and is_accelerate_version(">=", "0.14.0"):
             from accelerate import cpu_offload
@@ -1081,6 +1095,13 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
                 "It seems like you have activated a device mapping strategy on the pipeline so calling `enable_sequential_cpu_offload() isn't allowed. You can call `reset_device_map()` first and then call `enable_sequential_cpu_offload()`."
             )
 
+        # Auto-detect device if not specified: prefer NPU if available, otherwise CUDA
+        if device is None:
+            if is_torch_npu_available():
+                device = "npu"
+            else:
+                device = "cuda"
+        
         torch_device = torch.device(device)
         device_index = torch_device.index
 

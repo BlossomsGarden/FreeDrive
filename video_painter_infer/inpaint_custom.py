@@ -6,6 +6,16 @@ import argparse
 from typing import Optional, List
 import numpy as np
 import torch
+# Try to import torch_npu for NPU 910B support
+try:
+    import torch_npu
+    HAS_NPU = True
+    print("✓ torch_npu imported successfully - using NPU 910B device")
+except ImportError:
+    HAS_NPU = False
+    print("✓ torch_npu not available - using CUDA/CPU device")
+
+
 from diffusers import (
     CogVideoXDPMScheduler,
     CogvideoXBranchModel,
@@ -37,6 +47,43 @@ def _visualize_video(pipe, mask_background, original_video, video, masks):
         [original_video, masked_video, masks, video],
     )
     return video_
+
+
+def load_video_fast(video_path: str, return_fps: bool = False):
+    """
+    Fast video loading using OpenCV (cv2) instead of imageio.
+    This is much faster than imageio when decord is not available.
+    
+    Args:
+        video_path: Path to video file
+        return_fps: If True, also return FPS
+        
+    Returns:
+        List[Image.Image] if return_fps=False, or (List[Image.Image], int) if return_fps=True
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Failed to open video: {video_path}")
+    
+    # Get FPS if needed
+    fps = None
+    if return_fps:
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+    
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Convert BGR to RGB (OpenCV uses BGR by default)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(frame_rgb))
+    
+    cap.release()
+    
+    if return_fps:
+        return frames, fps
+    return frames
 
 
 def concatenate_images_horizontally(images_list, output_type="np"):
@@ -131,8 +178,8 @@ def load_mask_video(mask_path: str) -> List[Image.Image]:
             raise ValueError(f"Unsupported mask array shape: {mask_array.shape}. Expected (T, H, W) or (T, H, W, C)")
         return masks
     else:
-        # Video file
-        mask_video = load_video(mask_path)
+        # Video file - use fast OpenCV loading
+        mask_video = load_video_fast(mask_path)
         masks = []
         for frame in mask_video:
             # Convert to grayscale if RGB
@@ -174,8 +221,12 @@ def prepare_video_and_masks(
             - binary_masks: List[PIL.Image] - binary masks (RGB, 255=mask, 0=non-mask)
             - fps: int - video frame rate
     """
-    # Load RGB video
-    video = load_video(rgb_video_path)
+    # Load RGB video - use fast OpenCV loading (also get FPS to avoid reopening)
+    if fps is None or fps == 0:
+        video, fps = load_video_fast(rgb_video_path, return_fps=True)
+    else:
+        video = load_video_fast(rgb_video_path, return_fps=False)
+    
     video = [frame.convert("RGB") for frame in video]
     
     # Load mask video
@@ -192,34 +243,31 @@ def prepare_video_and_masks(
     video = video[start_frame:end_frame]
     mask_images = mask_images[start_frame:end_frame]
     
-    # Read FPS if not provided
-    if fps is None or fps == 0:
-        cap = cv2.VideoCapture(rgb_video_path)
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        cap.release()
-    
-    # Process masks and create masked video
+    # Process masks and create masked video (optimized for speed)
     masked_video = []
     binary_masks = []
     
     for frame, mask_img in zip(video, mask_images):
-        frame_array = np.array(frame)
-        mask_array = np.array(mask_img)
+        # Convert to numpy arrays once
+        frame_array = np.array(frame, dtype=np.uint8)
+        mask_array = np.array(mask_img, dtype=np.uint8)
         
-        # Convert RGB mask to grayscale binary mask
+        # Convert RGB mask to grayscale binary mask (optimized)
         if len(mask_array.shape) == 3:
-            mask_gray = np.mean(mask_array, axis=2)
+            # Use weighted average for better grayscale conversion (faster than mean)
+            mask_gray = (mask_array[:, :, 0] * 0.299 + 
+                        mask_array[:, :, 1] * 0.587 + 
+                        mask_array[:, :, 2] * 0.114).astype(np.uint8)
         else:
             mask_gray = mask_array
         
         # Binary mask: >128 means mask region
-        binary_mask = (mask_gray > 128).astype(bool)
+        binary_mask = mask_gray > 128
         
-        # Create masked frame (black in mask regions)
-        black_frame = np.zeros_like(frame_array)
-        binary_mask_expanded = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2)
-        masked_frame = np.where(binary_mask_expanded, black_frame, frame_array)
-        masked_video.append(Image.fromarray(masked_frame.astype(np.uint8)).convert("RGB"))
+        # Create masked frame (black in mask regions) - vectorized operation
+        masked_frame = frame_array.copy()
+        masked_frame[binary_mask] = 0
+        masked_video.append(Image.fromarray(masked_frame))
         
         # Create binary mask image
         if mask_background:
@@ -228,8 +276,9 @@ def prepare_video_and_masks(
         else:
             # Mask foreground: 255=mask region, 0=non-mask region
             binary_mask_image = np.where(binary_mask, 255, 0).astype(np.uint8)
-        binary_mask_rgb = np.repeat(binary_mask_image[:, :, np.newaxis], 3, axis=2)
-        binary_masks.append(Image.fromarray(binary_mask_rgb).convert("RGB"))
+        # Expand to RGB
+        binary_mask_rgb = np.stack([binary_mask_image] * 3, axis=2)
+        binary_masks.append(Image.fromarray(binary_mask_rgb))
     
     return video, masked_video, binary_masks, fps
 
@@ -324,7 +373,7 @@ def generate_video_v2v(
         branch = CogvideoXBranchModel.from_pretrained(
             inpainting_branch, 
             torch_dtype=dtype
-        ).to(dtype=dtype).cuda()
+        ).to(dtype=dtype).to("cuda" if not HAS_NPU else "npu")
         
         if id_adapter_resample_learnable_path is None:
             pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
@@ -339,7 +388,7 @@ def generate_video_v2v(
                 subfolder="transformer",
                 torch_dtype=dtype,
                 id_pool_resample_learnable=True,
-            ).to(dtype=dtype).cuda()
+            ).to(dtype=dtype).to("cuda" if not HAS_NPU else "npu")
             
             pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
                 model_path,
@@ -360,7 +409,7 @@ def generate_video_v2v(
             model_path,
             subfolder="transformer",
             torch_dtype=dtype,
-        ).to(dtype=dtype).cuda()
+        ).to(dtype=dtype).to("cuda" if not HAS_NPU else "npu")
         
         branch = CogvideoXBranchModel.from_transformer(
             transformer=transformer,
@@ -368,7 +417,7 @@ def generate_video_v2v(
             attention_head_dim=transformer.config.attention_head_dim,
             num_attention_heads=transformer.config.num_attention_heads,
             load_weights_from_transformer=True
-        ).to(dtype=dtype).cuda()
+        ).to(dtype=dtype).to("cuda" if not HAS_NPU else "npu")
         
         pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
             model_path,
@@ -395,8 +444,10 @@ def generate_video_v2v(
         pipe.scheduler.config, 
         timestep_spacing="trailing"
     )
-    pipe.to("cuda")
-    pipe.enable_sequential_cpu_offload()
+    pipe.to("cuda" if not HAS_NPU else "npu")
+
+    # 全注释 62139 MB
+    # pipe.enable_sequential_cpu_offload()
     # pipe.vae.enable_slicing()
     # pipe.vae.enable_tiling()
     
@@ -448,6 +499,7 @@ def generate_video_v2v(
         print("Warning: id_pool_resample_learnable requires mask_add=True. Setting mask_add=True.")
         mask_add = True
     
+    # return dict
     inpaint_outputs = pipe(
         prompt=prompt,
         image=image,
@@ -465,33 +517,26 @@ def generate_video_v2v(
         stride=int(frames - overlap_frames),
         prev_clip_weight=prev_clip_weight,
         id_pool_resample_learnable=id_pool_resample_learnable,
-        output_type="np"
-    ).frames[0]
-    
-    video_generate = inpaint_outputs
-    
-    # Restore first frame if needed
-    if first_frame_gt:
-        binary_masks[0] = gt_mask_first_frame
-        video[0] = gt_video_first_frame
-    
-    # Visualize and save
-    round_video = _visualize_video(
-        pipe, 
-        mask_background, 
-        video[:len(video_generate)], 
-        video_generate, 
-        binary_masks[:len(video_generate)]
+        output_type="latent"
     )
     
-    output_fps = down_sample_fps if down_sample_fps > 0 else fps
-    export_to_video(
-        round_video, 
-        output_path.replace(".mp4", f"_fps{output_fps}.mp4"), 
-        fps=output_fps
-    )
+    # Get latents from output
+    latents = inpaint_outputs.frames
+    print("Latents generated!")
+    print("inpait_outputs.frames shape:", inpaint_outputs.frames.shape)
     
-    print(f"Video saved to: {output_path}")
+    # Save latents to pth file
+    latent_output_path = output_path.replace(".mp4", "_latents.pth")
+    torch.save({
+        'latents': latents.cpu(),  # Move to CPU before saving
+        'fps': down_sample_fps if down_sample_fps > 0 else fps,
+        'num_frames': frames,
+        'shape': latents.shape,
+        'dtype': str(latents.dtype),
+    }, latent_output_path)
+    
+    print(f"Latents saved to: {latent_output_path}")
+
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@
 """
 conda activate wlh-py
 cd /data/wlh/FreeDrive/code/datasets
-CUDA_VISIBLE_DEVICES=2 python 
+CUDA_VISIBLE_DEVICES=2 python waymo_prepare.py
+CUDA_VISIBLE_DEVICES=1,5,6,7  nohup python waymo_prepare.py > out.log 2>&1 &
 """
 try:
     from waymo_open_dataset import dataset_pb2
@@ -47,43 +48,6 @@ MOVEABLE_OBJECTS_IDS = [
     cs_pb2.CameraSegmentation.TYPE_GROUND_ANIMAL,
     cs_pb2.CameraSegmentation.TYPE_PEDESTRIAN_OBJECT,
 ]
-
-
-def get_ground_np(pts):
-    """
-    Ground removal on a point cloud (NumPy version).
-    Modified from https://github.com/tusen-ai/LiDAR_SOT/blob/main/waymo_data/data_preprocessing/ground_removal.py
-
-    Args:
-        pts (numpy.ndarray): The input point cloud.
-
-    Returns:
-        numpy.ndarray: A boolean array indicating whether each point is ground.
-    """
-    th_seeds_ = 1.2
-    num_lpr_ = 20
-    n_iter = 10
-    th_dist_ = 0.3
-    pts_sort = pts[pts[:, 2].argsort(), :]
-    lpr = np.mean(pts_sort[:num_lpr_, 2])
-    pts_g = pts_sort[pts_sort[:, 2] < lpr + th_seeds_, :]
-    normal_ = np.zeros(3)
-    for _ in range(n_iter):
-        mean = np.mean(pts_g, axis=0)[:3]
-        xx = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 0] - mean[0]))
-        xy = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 1] - mean[1]))
-        xz = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 2] - mean[2]))
-        yy = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 1] - mean[1]))
-        yz = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 2] - mean[2]))
-        zz = np.mean((pts_g[:, 2] - mean[2]) * (pts_g[:, 2] - mean[2]))
-        cov = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=np.float32)
-        U, _, _ = np.linalg.svd(cov)
-        normal_ = U[:, 2]
-        d_ = -normal_.dot(mean)
-        th_dist_d_ = th_dist_ - d_
-        result = pts[:, :3] @ normal_[..., np.newaxis]
-        pts_g = pts[result.squeeze(-1) < th_dist_d_]
-    return result < th_dist_d_
 
 
 class ProgressBar:
@@ -477,7 +441,7 @@ class WaymoProcessor(object):
         )
         for frame_idx, data in enumerate(tqdm(
             dataset,
-            desc=f"File {file_idx}",
+            desc=f"{scene_name}",
             total=limit,
             dynamic_ncols=True,
         )):
@@ -488,7 +452,6 @@ class WaymoProcessor(object):
             self.save_image(frame, scene_name, frame_idx)
             self.save_calib(frame, scene_name, frame_idx)
             self.save_pose(frame, scene_name, frame_idx)
-            self.save_lidar_align(frame, scene_name, frame_idx, ri_index=0)
             self.save_dynamic_mask(frame, scene_name, frame_idx)
             if frame_idx == 0:
                 self.save_interested_labels(frame, scene_name)
@@ -527,7 +490,7 @@ class WaymoProcessor(object):
 
     def save_image(self, frame, scene_name, frame_idx):
         """Parse and save the images in jpg format.
-        Saves original images to images_raw, and clipped images to images_clip.
+        Saves images to images folder.
 
         Args:
             frame (:obj:`Frame`): Open dataset frame proto.
@@ -538,30 +501,10 @@ class WaymoProcessor(object):
             camera_id = img.name - 1
             filename = f"{str(frame_idx).zfill(3)}_{camera_id}.jpg"
             
-            # Save original image to images_raw
-            img_raw_path = f"{self.save_dir}/{scene_name}/images_raw/{filename}"
-            with open(img_raw_path, "wb") as fp:
+            # Save image to images folder
+            img_path = f"{self.save_dir}/{scene_name}/images/{filename}"
+            with open(img_path, "wb") as fp:
                 fp.write(img.image)
-            
-            # Process and save clipped image to images_clip
-            img_clip_path = f"{self.save_dir}/{scene_name}/images_clip/{filename}"
-            img_array = np.frombuffer(img.image, dtype=np.uint8)
-            img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            
-            if img_cv is not None:
-                h, w = img_cv.shape[:2]
-                if camera_id in [0, 1, 2]:
-                    # For camera_id 0, 1, 2 (1920x1280): crop top 394 pixels, keep bottom 1920x886
-                    if h == 1280 and w == 1920:
-                        cropped_img = img_cv[394:, :]
-                        cv2.imwrite(img_clip_path, cropped_img)
-                    else:
-                        cv2.imwrite(img_clip_path, img_cv)
-                elif camera_id in [3, 4]:
-                    # For camera_id 3, 4 (1920x886): keep as is
-                    cv2.imwrite(img_clip_path, img_cv)
-                else:
-                    cv2.imwrite(img_clip_path, img_cv)
 
     def save_calib(self, frame, scene_name, frame_idx):
         """Parse and save the calibration data.
@@ -591,49 +534,6 @@ class WaymoProcessor(object):
                 f"{self.save_dir}/{scene_name}/intrinsics/" + f"{str(i)}.txt",
                 intrinsics[i],
             )
-
-
-    def save_lidar_align(self, frame, scene_name, frame_idx, ri_index=0):
-        """Precompute LiDAR-to-camera projections per frame for faster alignment."""
-        (
-            range_images,
-            camera_projections,
-            _,
-            range_image_top_pose,
-        ) = frame_utils.parse_range_image_and_camera_projection(frame)
-        frame.lasers.sort(key=lambda laser: laser.name)
-        points_list, points_cp_list = frame_utils.convert_range_image_to_point_cloud(
-            frame,
-            range_images,
-            camera_projections,
-            range_image_top_pose,
-            ri_index=ri_index,
-        )
-        if not points_list or not points_cp_list:
-            return
-
-        points_all = np.concatenate(points_list, axis=0)
-        points_cp_all = np.concatenate(points_cp_list, axis=0)
-        distances = np.linalg.norm(points_all, axis=-1)
-
-        calib_map = {cc.name: cc for cc in frame.context.camera_calibrations}
-        for image in frame.images:
-            cam_id = image.name
-            mask = points_cp_all[:, 0] == cam_id
-            if not np.any(mask):
-                continue
-            cp_sel = points_cp_all[mask]
-            depth_sel = distances[mask]
-            projected = np.concatenate([cp_sel[:, 1:3], depth_sel[:, None]], axis=-1).astype(np.float32)
-            calib = calib_map.get(cam_id, None)
-            h = getattr(image, "height", None)
-            w = getattr(image, "width", None)
-            if calib is not None:
-                h = calib.height
-                w = calib.width
-            hw = np.array([h, w], dtype=np.int32)
-            out_path = f"{self.save_dir}/{scene_name}/lidar_align/{str(frame_idx).zfill(3)}_{image.name - 1}.npz"
-            np.savez_compressed(out_path, projected=projected, hw=hw)
 
 
     def save_pose(self, frame, scene_name, frame_idx):
@@ -667,7 +567,7 @@ class WaymoProcessor(object):
         for img in frame.images:
             # dynamic_mask
             img_path = (
-                f"{self.save_dir}/{scene_name}/images_raw/"
+                f"{self.save_dir}/{scene_name}/images/"
                 + f"{str(frame_idx).zfill(3)}_{str(img.name - 1)}.jpg"
             )
             img_shape = np.array(Image.open(img_path))
@@ -757,13 +657,13 @@ class WaymoProcessor(object):
             dynamic_mask.save(dynamic_mask_path)
 
     def save_videos(self, scene_name, num_frames):
-        """Create per-camera mp4 videos from saved images (using clipped images)."""
+        """Create per-camera mp4 videos from saved images."""
         os.makedirs(f"{self.save_dir}/{scene_name}/videos", exist_ok=True)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         for cam_id in range(len(self.cam_list)):
             first_frame_path = (
-                f"{self.save_dir}/{scene_name}/images_raw/{str(0).zfill(3)}_{cam_id}.jpg"
+                f"{self.save_dir}/{scene_name}/images/{str(0).zfill(3)}_{cam_id}.jpg"
             )
             if not os.path.exists(first_frame_path):
                 continue
@@ -778,7 +678,7 @@ class WaymoProcessor(object):
             # Write frames in order; skip missing frames silently.
             for idx in range(num_frames):
                 img_path = (
-                    f"{self.save_dir}/{scene_name}/images_raw/{str(idx).zfill(3)}_{cam_id}.jpg"
+                    f"{self.save_dir}/{scene_name}/images/{str(idx).zfill(3)}_{cam_id}.jpg"
                 )
                 img = cv2.imread(img_path)
                 if img is None:
@@ -790,8 +690,7 @@ class WaymoProcessor(object):
     def create_folder(self):
         """Create folder for data preprocessing."""
         for scene_name in self.scene_names:
-            os.makedirs(f"{self.save_dir}/{scene_name}/images_raw", exist_ok=True)
-            os.makedirs(f"{self.save_dir}/{scene_name}/images_clip", exist_ok=True)
+            os.makedirs(f"{self.save_dir}/{scene_name}/images", exist_ok=True)
             os.makedirs(
                 f"{self.save_dir}/{scene_name}/ego_pose",
                 exist_ok=True,
@@ -812,15 +711,16 @@ class WaymoProcessor(object):
                 f"{self.save_dir}/{scene_name}/videos",
                 exist_ok=True,
             )
-            os.makedirs(
-                f"{self.save_dir}/{scene_name}/lidar_align",
-                exist_ok=True,
-            )
+
+
+
+
 
 if __name__ == "__main__":
     processor = WaymoProcessor(
-        load_dir="/data/wlh/FreeDrive/data/waymo/raw",
+        load_dir="/data1/DATA/wod/raw/training",
         save_dir="/data/wlh/FreeDrive/data/waymo/processed",
+        workers=8,
         num_frames=None,    # None means process all frames
     )
     processor.convert()

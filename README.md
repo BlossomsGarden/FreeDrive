@@ -4,22 +4,35 @@
 
 ```
 FreeDrive
-├── code
+├── code (This Repo)
 │   ├── datasets
 │   │   ├── waymo_lidar_to_2d_img.py            # waymo dataset lidar projector tool
 │   │   └── waymo_prepare.py                    # waymo dataset processor
 │   ├── pointcloud
-│   │   ├── depth_anything_3                    # da3 official code
-│   │   ├── da3_infer.py                        # get per-frame depth using front 3 cameras 
-│   │   ├── point_cloud_painter_prepare.py      # construct train-dataset for PointCloudPainter 
-│   │   ├── render_from_npz.py                  # render point cloud video in given camera traj
-│   │   └── requiremetns.txt                    # 4090 / 910B environment
+│   │   ├── da3
+│   │   │   ├── 910B-scripts                    # scrripts for pcp prepare on 910B 
+│   │   │   ├── depth_anything_3
+│   │   │   ├── da3_infer.py                    # demo
+│   │   │   ├── pcp_dataset_pipeline.py         # construct train-dataset for PointCloudPainter 
+│   │   │   ├── reinfer.py                      # re-call da3 with new traj
+│   │   │   ├── render_from_npz.py              # render video from depth.npz
+│   │   │   ├── reprojector.py                  # render point cloud video in given camera traj
+│   │   │   └── requiremetns.txt                # 4090 / 910B environment
+│   │   └── vda
+│   │       ├── utils
+│   │       ├── video_depth_anything
+│   │       ├── pcp_dataset_pipeline.py         # construct train-dataset for PointCloudPainter 
+│   │       ├── render_from_npz.py              # render point cloud video in given camera traj
+│   │       ├── requiremetns.txt                # only 4090 environment
+│   │       └── vda_infer.py                    # demo
 │   └── video_painter_infer
 │       ├── diffusers
 │       ├── example                             # i/o params demo
+│       ├── decode_latents.py                   # read pth and decode           
 │       ├── inpaint_custom.py           
 │       ├── inpaint_custom.sh                   # bash for customized input
-│       └── requirements.txt                    # 4090 environment
+│       ├── inpaint_custom_910B.sh              # bash for customized input
+│       └── requirements.txt                    # 4090 / 910B environment
 └── data
     └── waymo
         ├── raw
@@ -28,11 +41,9 @@ FreeDrive
             └── segment-10061305430875486848_1080_000_1100_000_with_camera_labels
                 ├── dynamic_masks
                 ├── ego_pose
-                ├── extrinsics           
-                ├── images_clip                 # clip top pixels of FRONT 3 cameras to 1920*886 (Deprecated)
-                ├── images_raw
+                ├── extrinsics
+                ├── images
                 ├── intrinsics
-                ├── lidar_align                 # align depth with real-world scale (Deprecated)    
                 └── videos
 ```
 
@@ -90,11 +101,12 @@ bash inpaint_custom.sh
 
 通过先使用数据集前三相机获得的点云获得某新轨迹下的三相机失真点云视频，再使用该失真点云视频获得的点云重新获得原 FRONT 轨迹下的失真点云视频，
 并记录 mask，结合数据集中的 FRONT 驾驶视频，就构建出了一个 occlusion/mask/GT 的训练数据。
+da3 给出了 910B / 4090D 版本的代码，vda 仅给出 4090D 版本的代码
 ```
 /pointcloud/requirements.txt
 conda activate da3
-cd /data/wlh/FreeDrive/code/pointcloud
-CUDA_VISIBLE_DEVICES=3 python point_cloud_painter_prepare.py
+cd /data/wlh/FreeDrive/code/pointcloud/da3
+CUDA_VISIBLE_DEVICES=3 python pcp_dataset_pipeline.py
 ```
 
 <div align="center">
@@ -120,7 +132,7 @@ CUDA_VISIBLE_DEVICES=3 python point_cloud_painter_prepare.py
 - [x] [2025/12/15] Reload scene from *.npz, get dense point cloud seq, unseen patch seq with given camera
 - [x] [2025/12/16] Test VideoPainter with custom mask/rgb video.
 - [x] [2025/12/19] Per-frame project with 3 cameras.
-- [ ] Construct fine-tune dataset
+- [x] [2025/12/24] Construct fine-tune dataset
 - [ ] FID/NTA IoU scripts
 - [ ] Add reference frame/bbox branch and fine-tune
 - [ ] Possibility to change env settings

@@ -35,3 +35,16 @@ pip install -e .
 
 conda install -c conda-forge ffmpeg -y
 
+
+# 910B
+# pip install torch==2.4.0 torch_npu==2.4.0.post2 torchvision==0.19.0
+# ERROR: Could not find a version that satisfies the requirement decord==0.6.0 (from versions: none)
+# ERROR: No matching distribution found for decord==0.6.0
+pip install torch torchvision transformers==4.42.2  accelerate==1.12.0  deepspeed==0.18.3  pytorchvideo==0.1.5 
+pip install opencv-python==4.10.0.84  numpy==1.26.0  pillow==9.5.0   imageio>=2.35.1  imageio-ffmpeg==0.5.1  ffmpeg-python moviepy>=1.0.3   kornia==0.7.3  scikit-image \
+scipy   einops  rotary_embedding_torch  pytorch_lightning easydict  pandas  matplotlib   gradio==3.40.0   wandb  nvitop   omegaconf==2.3.0 \
+beartype==0.18.5   fsspec==2024.5.0   safetensors==0.4.3    av==13.1.0  gdown peft  huggingface_hub==0.25.0
+pip install urllib3==1.26.7
+
+cd ./diffusers
+pip install -e .

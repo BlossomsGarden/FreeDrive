@@ -316,6 +316,8 @@ class CogVideoXDownsample3D(nn.Module):
     ):
         super().__init__()
 
+        # DAMN YOU #
+        # FUCK YOU NPU nn.conv2D#
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         self.compress_time = compress_time
 
@@ -347,6 +349,16 @@ class CogVideoXDownsample3D(nn.Module):
         batch_size, channels, frames, height, width = x.shape
         # (batch_size, channels, frames, height, width) -> (batch_size, frames, channels, height, width) -> (batch_size * frames, channels, height, width)
         x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
+
+        # print("x.device:", x.device)
+        # print("self.conv.weight.device:", self.conv.weight.device)
+
+        # Note: When using enable_sequential_cpu_offload(), weights may initially be on 'meta' device.
+        # The 'meta' device is a special PyTorch device that doesn't allocate actual memory - it's used
+        # by accelerate for lazy loading to save memory. accelerate's cpu_offload hook will automatically
+        # load weights from 'meta' to the actual device (e.g., npu:0) when forward() is called.
+        # This is normal behavior and the hook will handle device transfer automatically.
+
         x = self.conv(x)
         # (batch_size * frames, channels, height, width) -> (batch_size, frames, channels, height, width) -> (batch_size, channels, frames, height, width)
         x = x.reshape(batch_size, frames, x.shape[1], x.shape[2], x.shape[3]).permute(0, 2, 1, 3, 4)
